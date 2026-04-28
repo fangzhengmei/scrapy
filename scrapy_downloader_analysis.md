@@ -2807,6 +2807,461 @@ def _get_concurrency_delay(
 
 ---
 
+## 16. 中间件参数签名兼容机制
+
+### 16.1 问题背景
+
+Scrapy 的中间件方法（`process_request`、`process_response`、`process_exception`）历史上有两种参数签名风格：
+
+**旧风格（接收 spider 参数）**：
+```python
+class OldStyleMiddleware:
+    def process_request(self, request, spider):
+        # spider 参数是必需的
+        spider.logger.info("Processing request")
+        return None
+    
+    def process_response(self, request, response, spider):
+        return response
+```
+
+**新风格（不接收 spider 参数）**：
+```python
+class NewStyleMiddleware:
+    def __init__(self, crawler):
+        self.crawler = crawler  # 通过 crawler 访问 spider
+    
+    @classmethod
+    def from_crawler(cls, crawler):
+        return cls(crawler)
+    
+    def process_request(self, request):
+        # 不接收 spider 参数，通过 self.crawler.spider 访问
+        self.crawler.spider.logger.info("Processing request")
+        return None
+```
+
+框架需要在调用中间件时，自动判断该方法需要哪种签名，并据此决定是否传递 `spider` 参数。
+
+### 16.2 核心判断机制：argument_is_required()
+
+#### 16.2.1 函数签名解析
+
+框架通过 `argument_is_required()` 函数判断方法是否需要某个参数：
+
+```python
+def argument_is_required(func: Callable[..., Any], arg_name: str) -> bool:
+    """
+    Check if a function argument is required (exists and doesn't have a default value).
+
+    .. versionadded:: 2.14
+
+    >>> def func(a, b=1, c=None):
+    ...     pass
+    >>> argument_is_required(func, 'a')
+    True
+    >>> argument_is_required(func, 'b')
+    False
+    >>> argument_is_required(func, 'c')
+    False
+    >>> argument_is_required(func, 'd')
+    False
+    """
+    args = get_func_args_dict(func)  # 获取函数参数字典
+    param = args.get(arg_name)      # 查找目标参数
+    # 判断：参数存在 且 没有默认值
+    return param is not None and param.default is inspect.Parameter.empty
+```
+[deprecate.py:203-222](file:///g:/fangzheng/solo-dogfeeding/code/scrapy-8941/scrapy/utils/deprecate.py#L203-L222)
+
+#### 16.2.2 函数参数字典获取
+
+`get_func_args_dict()` 函数负责解析函数签名：
+
+```python
+def get_func_args_dict(
+    func: Callable[..., Any], stripself: bool = False
+) -> Mapping[str, inspect.Parameter]:
+    """Return the argument dict of a callable object.
+
+    .. versionadded:: 2.14
+    """
+    if not callable(func):
+        raise TypeError(f"func must be callable, got '{type(func).__name__}'")
+
+    args: Mapping[str, inspect.Parameter]
+    try:
+        sig = inspect.signature(func)  # 使用 Python 内置的签名解析
+    except ValueError:
+        return {}
+
+    # 处理 functools.partial 包装的函数
+    if isinstance(func, partial):
+        partial_args = func.args
+        partial_kw = func.keywords
+
+        args = {}
+        for name, param in sig.parameters.items():
+            if name in partial_args:
+                continue  # 已被 partial 绑定的位置参数
+            if partial_kw and name in partial_kw:
+                continue  # 已被 partial 绑定的关键字参数
+            args[name] = param
+    else:
+        args = sig.parameters
+
+    # 可选：移除 self 参数
+    if stripself and args and "self" in args:
+        args = {k: v for k, v in args.items() if k != "self"}
+    return args
+```
+[python.py:172-204](file:///g:/fangzheng/solo-dogfeeding/code/scrapy-8941/scrapy/utils/python.py#L172-L204)
+
+### 16.3 标记存储与查找过程
+
+#### 16.3.1 初始化时的标记
+
+标记过程发生在中间件管理器初始化阶段，通过 `_check_mw_method_spider_arg()` 方法：
+
+```python
+class MiddlewareManager(ABC):
+    def __init__(self, *middlewares: Any, crawler: Crawler | None = None) -> None:
+        # ... 其他初始化代码
+        self._mw_methods_requiring_spider: set[Callable] = set()  # 标记集合
+        for mw in middlewares:
+            self._add_middleware(mw)  # 逐个添加中间件
+
+    def _check_mw_method_spider_arg(self, method: Callable) -> None:
+        # 核心判断：方法是否需要 spider 参数
+        if argument_is_required(method, "spider"):
+            # 发出废弃警告
+            warnings.warn(
+                f"{method.__qualname__}() requires a spider argument,"
+                f" this is deprecated and the argument will not be passed in future Scrapy versions."
+                f" If you need to access the spider instance you can save the crawler instance"
+                f" passed to from_crawler() and use its spider attribute.",
+                category=ScrapyDeprecationWarning,
+                stacklevel=2,
+            )
+            # 将方法添加到标记集合中
+            self._mw_methods_requiring_spider.add(method)
+```
+[middleware.py:35-132](file:///g:/fangzheng/solo-dogfeeding/code/scrapy-8941/scrapy/middleware.py#L35-L132)
+
+#### 16.3.2 下载中间件的具体标记过程
+
+在 `DownloaderMiddlewareManager._add_middleware()` 中，对三类方法分别进行标记：
+
+```python
+class DownloaderMiddlewareManager(MiddlewareManager):
+    def _add_middleware(self, mw: Any) -> None:
+        # 标记 process_request
+        if hasattr(mw, "process_request"):
+            self.methods["process_request"].append(mw.process_request)
+            self._check_mw_method_spider_arg(mw.process_request)  # 检查并标记
+        
+        # 标记 process_response
+        if hasattr(mw, "process_response"):
+            self.methods["process_response"].appendleft(mw.process_response)
+            self._check_mw_method_spider_arg(mw.process_response)  # 检查并标记
+        
+        # 标记 process_exception
+        if hasattr(mw, "process_exception"):
+            self.methods["process_exception"].appendleft(mw.process_exception)
+            self._check_mw_method_spider_arg(mw.process_exception)  # 检查并标记
+```
+[middleware.py:43-52](file:///g:/fangzheng/solo-dogfeeding/code/scrapy-8941/scrapy/core/downloader/middleware.py#L43-L52)
+
+### 16.4 框架侧的调用形式决定
+
+#### 16.4.1 调用时的判断逻辑
+
+在下载中间件的处理链中，调用时会检查方法是否在标记集合中：
+
+```python
+async def process_request(request: Request) -> Response | Request:
+    for method in self.methods["process_request"]:
+        method = cast("Callable", method)
+        
+        # 核心判断：检查方法是否需要 spider 参数
+        if method in self._mw_methods_requiring_spider:
+            # 旧风格：传递 spider 参数
+            response = await ensure_awaitable(
+                method(request=request, spider=self._spider),
+                _warn=global_object_name(method),
+            )
+        else:
+            # 新风格：不传递 spider 参数
+            response = await ensure_awaitable(
+                method(request=request),
+                _warn=global_object_name(method),
+            )
+        # ... 后续处理
+```
+[middleware.py:78-99](file:///g:/fangzheng/solo-dogfeeding/code/scrapy-8941/scrapy/core/downloader/middleware.py#L78-L99)
+
+#### 16.4.2 三类方法的调用逻辑
+
+**process_response 的调用**：
+```python
+async def process_response(response: Response | Request) -> Response | Request:
+    # ... 前置检查
+    for method in self.methods["process_response"]:
+        method = cast("Callable", method)
+        
+        # 同样的判断逻辑
+        if method in self._mw_methods_requiring_spider:
+            response = await ensure_awaitable(
+                method(request=request, response=response, spider=self._spider),
+                _warn=global_object_name(method),
+            )
+        else:
+            response = await ensure_awaitable(
+                method(request=request, response=response),
+                _warn=global_object_name(method),
+            )
+        # ... 后续处理
+```
+[middleware.py:107-125](file:///g:/fangzheng/solo-dogfeeding/code/scrapy-8941/scrapy/core/downloader/middleware.py#L107-L125)
+
+**process_exception 的调用**：
+```python
+async def process_exception(exception: Exception) -> Response | Request:
+    for method in self.methods["process_exception"]:
+        method = cast("Callable", method)
+        
+        # 同样的判断逻辑
+        if method in self._mw_methods_requiring_spider:
+            response = await ensure_awaitable(
+                method(
+                    request=request, exception=exception, spider=self._spider
+                ),
+                _warn=global_object_name(method),
+            )
+        else:
+            response = await ensure_awaitable(
+                method(request=request, exception=exception),
+                _warn=global_object_name(method),
+            )
+        # ... 后续处理
+```
+[middleware.py:128-151](file:///g:/fangzheng/solo-dogfeeding/code/scrapy-8941/scrapy/core/downloader/middleware.py#L128-L151)
+
+### 16.5 Spider 实例的获取
+
+当需要传递 `spider` 参数时，框架通过 `_spider` 属性获取：
+
+```python
+class MiddlewareManager(ABC):
+    _compat_spider: Spider | None = None
+
+    @property
+    def _spider(self) -> Spider:
+        # 优先从 crawler 获取（新风格）
+        if self.crawler is not None:
+            if self.crawler.spider is None:
+                raise ValueError(
+                    f"{type(self).__name__} needs to access self.crawler.spider but it is None."
+                )
+            return self.crawler.spider
+        
+        # 兼容旧版本（通过 _set_compat_spider 设置）
+        if self._compat_spider is not None:
+            return self._compat_spider
+        
+        raise ValueError(f"{type(self).__name__} has no known Spider instance.")
+
+    def _set_compat_spider(self, spider: Spider | None) -> None:
+        # 用于已废弃的 download() 方法
+        if spider is None or self.crawler is not None:
+            return
+        # printing a deprecation warning is the caller's responsibility
+        if self._compat_spider is None:
+            self._compat_spider = spider
+        elif self._compat_spider is not spider:
+            raise RuntimeError(
+                f"Different instances of Spider were passed to {type(self).__name__}:"
+                f" {self._compat_spider} and {spider}"
+            )
+```
+[middleware.py:61-83](file:///g:/fangzheng/solo-dogfeeding/code/scrapy-8941/scrapy/middleware.py#L61-L83)
+
+### 16.6 完整流程图
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  中间件参数签名兼容机制完整流程                                                │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  阶段 1：初始化时标记（MiddlewareManager.__init__）                           │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                                │
+│  MiddlewareManager 初始化                                                       │
+│      │                                                                         │
+│      ▼                                                                         │
+│  self._mw_methods_requiring_spider = set()  ←── 创建标记集合                 │
+│      │                                                                         │
+│      ▼                                                                         │
+│  for mw in middlewares:                                                        │
+│      self._add_middleware(mw)                                                  │
+│      │                                                                         │
+│      ▼                                                                         │
+│      ┌──────────────────────────────────────────────────────────────────┐   │
+│      │ DownloaderMiddlewareManager._add_middleware(mw):                 │   │
+│      │                                                                      │   │
+│      │ if hasattr(mw, "process_request"):                                 │   │
+│      │     self.methods["process_request"].append(mw.process_request)    │   │
+│      │     self._check_mw_method_spider_arg(mw.process_request)  ←── 标记 │   │
+│      │                                                                      │   │
+│      │ if hasattr(mw, "process_response"):                                │   │
+│      │     self.methods["process_response"].appendleft(mw.process_response)│   │
+│      │     self._check_mw_method_spider_arg(mw.process_response) ←── 标记 │   │
+│      │                                                                      │   │
+│      │ if hasattr(mw, "process_exception"):                               │   │
+│      │     self.methods["process_exception"].appendleft(mw.process_exception)│  │
+│      │     self._check_mw_method_spider_arg(mw.process_exception) ←── 标记│   │
+│      └──────────────────────────────────────────────────────────────────┘   │
+│                                                                                │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  阶段 2：标记检查逻辑（_check_mw_method_spider_arg）                         │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                                │
+│  def _check_mw_method_spider_arg(self, method: Callable):                    │
+│      │                                                                         │
+│      ▼                                                                         │
+│  if argument_is_required(method, "spider"):  ←── 核心判断函数                │
+│      │                                                                         │
+│      ├──▶ 发出废弃警告                                                         │
+│      │         ScrapyDeprecationWarning                                       │
+│      │         f"{method.__qualname__}() requires a spider argument..."      │
+│      │                                                                         │
+│      └──▶ self._mw_methods_requiring_spider.add(method)  ←── 添加到标记集合  │
+│                                                                                │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  阶段 3：参数判断核心（argument_is_required）                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                                │
+│  def argument_is_required(func, arg_name):                                    │
+│      │                                                                         │
+│      ▼                                                                         │
+│  args = get_func_args_dict(func)  ←── 获取函数签名                            │
+│      │                                                                         │
+│      ├──▶ get_func_args_dict 内部：                                            │
+│      │         sig = inspect.signature(func)  ←── Python 内置签名解析        │
+│      │         处理 partial 对象（已绑定参数移除）                             │
+│      │         返回 Mapping[str, inspect.Parameter]                           │
+│      │                                                                         │
+│      ▼                                                                         │
+│  param = args.get(arg_name)                                                    │
+│      │                                                                         │
+│      ▼                                                                         │
+│  return (param is not None                                                     │
+│          and param.default is inspect.Parameter.empty)  ←── 无默认值才是必需 │
+│                                                                                │
+│  示例：                                                                         │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │ def func(a, b=1, c=None, *, d, e=2):                                 │   │
+│  │     pass                                                               │   │
+│  │                                                                         │   │
+│  │ argument_is_required(func, 'a')  → True   (无默认值)                 │   │
+│  │ argument_is_required(func, 'b')  → False  (有默认值 1)               │   │
+│  │ argument_is_required(func, 'c')  → False  (有默认值 None)            │   │
+│  │ argument_is_required(func, 'd')  → True   (关键字参数，无默认值)     │   │
+│  │ argument_is_required(func, 'e')  → False  (关键字参数，有默认值 2)   │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+│                                                                                │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  阶段 4：运行时调用判断                                                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                                │
+│  以 process_request 为例：                                                      │
+│                                                                                │
+│  for method in self.methods["process_request"]:                               │
+│      │                                                                         │
+│      ▼                                                                         │
+│  if method in self._mw_methods_requiring_spider:  ←── 检查标记              │
+│      │                                                                         │
+│      ├──▶ True：旧风格，需要 spider 参数                                       │
+│      │         │                                                               │
+│      │         ▼                                                               │
+│      │    method(request=request, spider=self._spider)  ←── 传递 spider     │
+│      │                                                                         │
+│      └──▶ False：新风格，不需要 spider 参数                                    │
+│               │                                                                │
+│               ▼                                                                │
+│          method(request=request)  ←── 不传递 spider                          │
+│                                                                                │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 16.7 两种签名风格对比
+
+| 对比项 | 旧风格（推荐迁移） | 新风格（推荐） |
+|--------|-------------------|----------------|
+| **参数签名** | `def process_request(self, request, spider)` | `def process_request(self, request)` |
+| **Spider 获取方式** | 通过参数直接接收 | 通过 `self.crawler.spider` |
+| **初始化要求** | 不需要 `from_crawler` | 需要 `from_crawler` 保存 crawler |
+| **废弃状态** | 已废弃，会发出警告 | 推荐使用 |
+| **调用时标记** | 会被添加到 `_mw_methods_requiring_spider` | 不会被添加 |
+
+### 16.8 迁移示例
+
+**旧风格代码**：
+```python
+class OldStyleMiddleware:
+    def process_request(self, request, spider):
+        spider.logger.info(f"Processing: {request.url}")
+        if spider.custom_setting.get("SOME_FLAG"):
+            request.meta["flag"] = True
+        return None
+```
+
+**新风格代码（推荐）**：
+```python
+class NewStyleMiddleware:
+    def __init__(self, crawler):
+        self.crawler = crawler
+        self.spider = crawler.spider  # 或者在运行时访问
+
+    @classmethod
+    def from_crawler(cls, crawler):
+        return cls(crawler)
+
+    def process_request(self, request):
+        # 通过 self.crawler.spider 访问
+        self.crawler.spider.logger.info(f"Processing: {request.url}")
+        if self.crawler.settings.get("SOME_FLAG"):
+            request.meta["flag"] = True
+        return None
+```
+
+### 16.9 关键代码位置索引（补充 4）
+
+| 功能 | 文件位置 | 关键行号 |
+|------|----------|----------|
+| argument_is_required 核心判断 | `scrapy/utils/deprecate.py` | 203-222 |
+| get_func_args_dict 签名解析 | `scrapy/utils/python.py` | 172-204 |
+| _check_mw_method_spider_arg | `scrapy/middleware.py` | 122-132 |
+| _mw_methods_requiring_spider 集合 | `scrapy/middleware.py` | 57 |
+| _spider 属性获取 | `scrapy/middleware.py` | 62-71 |
+| _set_compat_spider | `scrapy/middleware.py` | 73-83 |
+| 下载中间件标记过程 | `scrapy/core/downloader/middleware.py` | 43-52 |
+| process_request 调用判断 | `scrapy/core/downloader/middleware.py` | 78-99 |
+| process_response 调用判断 | `scrapy/core/downloader/middleware.py` | 107-125 |
+| process_exception 调用判断 | `scrapy/core/downloader/middleware.py` | 128-151 |
+
+---
+
 *报告生成时间: 2026-04-28*
 *分析基于 Scrapy 源代码版本: 本地仓库版本*
-*最后更新: 2026-04-28（新增第 8-15 章，修正第 10、11 章）*
+*最后更新: 2026-04-28（新增第 8-16 章，修正第 10、11 章）*
