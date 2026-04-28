@@ -55,35 +55,75 @@ def fingerprint(
 
 百分号编码的不一致是导致重复请求漏检的常见原因。`w3lib.url.canonicalize_url` 会执行以下归一化处理：
 
-**1. 百分号编码大小写统一**
+**1. 路径部分的百分号编码归一化**
 
-所有百分号编码序列统一转换为大写十六进制：
+**核心实现链**（基于 w3lib 源码分析）：
 
-| 原始形式 | 归一化后 | 说明 |
+```python
+# 解码路径中的百分号编码序列为 UTF-8（或保持原始字节）
+uqp = _unquotepath(path)
+# 重新编码路径，这会将百分号编码规范化为大写 %XX
+path = quote(uqp, _path_safe_chars) or "/"
+```
+
+**步骤解析**：
+
+| 步骤 | 操作 | 效果 |
+|-----|------|------|
+| 1 | `_unquotepath(path)` | 解码所有 `%XX` 序列为原始字符 |
+| 2 | `quote(uqp, _path_safe_chars)` | 仅对不安全字符重新编码，生成大写 `%XX` |
+
+**归一化效果**：
+
+| 原始 URL | 归一化后 | 说明 |
 |---------|---------|------|
-| `%2f` | `%2F` | 小写转大写 |
-| `%3a` | `%3A` | 冒号编码归一化 |
-| `http://example.com/%61%62%63` | `http://example.com/abc` | 可打印 ASCII 字符解码（如 `%61`='a'） |
+| `http://example.com/path%2fname` | `http://example.com/path%2Fname` | 小写 `%2f` → 大写 `%2F` |
+| `http://example.com/%61%62%63` | `http://example.com/abc` | 可打印字符 `%61%62%63` = "abc" 被解码 |
+| `http://example.com/path%20name` | `http://example.com/path%20name` | 路径中的空格保持 `%20`（不会转为 `+`） |
 
-**实现原理**（基于 w3lib 源码分析）：
-```
-1. 解码路径中的百分号编码序列为 UTF-8（或保持原始字节）
-2. 使用 `urllib.parse.quote` 重新编码
-3. quote 函数默认生成大写的 %XX 序列
-```
-
-这确保了 `http://example.com/path%2fname` 和 `http://example.com/path%2Fname` 生成相同指纹。
+**关键证据**：
+- w3lib 使用 `_unquotepath` 函数解码路径中的百分号编码
+- 然后使用 `urllib.parse.quote` 重新编码，该函数默认生成大写的 `%XX` 序列
+- 安全字符（字母、数字、`-._~` 等）在 `quote` 时不会被编码，因此表现为"被解码"
 
 **2. 查询参数中空格的等价性处理**
 
-在查询参数中，空格有两种表示方式：`%20` 和 `+`。`canonicalize_url` 会将它们统一规范化：
+**核心实现链**：
+
+```python
+# 解析查询参数（parse_qs 会将 + 解码为空格）
+query_args = parse_qs(
+    query,
+    keep_blank_values=keep_blank_values,
+    strict_parsing=False,
+)
+# 重新编码查询参数（urlencode 默认使用 + 作为空格编码）
+if query_args:
+    query = urlencode(sorted(query_args.items(), key=lambda x: x[0]), doseq=True)
+else:
+    query = ""
+```
+
+**步骤解析**：
+
+| 步骤 | 函数 | 行为 |
+|-----|------|------|
+| 1 | `parse_qs(query)` | 解析查询字符串，将 `+` 和 `%20` 都解码为空格 |
+| 2 | `urlencode(...)` | 重新编码，默认使用 `+` 表示空格（符合 `application/x-www-form-urlencoded`） |
+
+**归一化效果**：
 
 | 原始 URL | 规范化后 | 说明 |
 |---------|---------|------|
 | `http://example.com?q=hello%20world` | `http://example.com?q=hello+world` | `%20` → `+` |
 | `http://example.com?q=hello+world` | `http://example.com?q=hello+world` | 保持 `+` 形式 |
 
-**注意**：这种规范化仅适用于**查询参数**部分。路径部分的空格（`%20`）不会被转换为 `+`，因为 `+` 在路径中没有特殊含义。
+**设计选择依据**：
+- 查询字符串的这种处理方式源于 **HTML4 规范**的 `application/x-www-form-urlencoded` 媒体类型
+- 该格式定义空格用 `+` 表示，其他特殊字符用百分号编码
+- 这也是为什么 `urllib.parse.urlencode` 默认使用 `+` 作为空格编码
+
+**注意**：这种规范化**仅适用于查询参数**部分。路径部分的空格（`%20`）不会被转换为 `+`，因为 `+` 在路径中没有特殊含义（在路径中 `+` 就是字面的加号字符）。
 
 #### 1.2.3 路径规范化（关键补充）
 
