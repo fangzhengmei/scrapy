@@ -440,6 +440,391 @@ def _dq(self) -> ScrapyPriorityQueue:
 
 **状态文件**：`JOBDIR/requests.queue/active.json` 存储活跃的优先级列表。
 
+### 3.8 队列策略设计动机深度分析
+
+#### 3.8.1 DownloaderAwarePriorityQueue：感知下载器负载的调度策略
+
+**为什么默认选择感知下载器负载的调度策略，而非简单优先级调度？**
+
+##### 简单优先级调度的局限性
+
+在分析 `DownloaderAwarePriorityQueue` 之前，先理解简单优先级调度（`ScrapyPriorityQueue`）的工作方式：
+
+```python
+# ScrapyPriorityQueue 的出队逻辑（简化）
+def pop(self) -> Request | None:
+    while self.curprio is not None:
+        # 只看当前最高优先级的队列
+        q = self.queues[self.curprio]
+        m = q.pop()
+        if not q:
+            del self.queues[self.curprio]
+            self._update_curprio()
+        return m
+    return None
+```
+
+**简单优先级调度的问题**：
+
+| 问题场景 | 现象描述 | 后果 |
+|----------|----------|------|
+| **单域名阻塞** | 高优先级请求全部来自同一域名 | 其他域名的请求被饿死，下载器 slot 分配不均 |
+| **优先级反转** | 某域名持续产生高优先级请求 | 其他域名的低优先级请求永远得不到处理 |
+| **资源浪费** | 某些域名 slot 空闲，某些满负载 | 下载器并发能力未充分利用 |
+
+##### 感知下载器负载的公平性保证
+
+`DownloaderAwarePriorityQueue` 的核心创新在于 **slot 级别的两级调度**：
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│              DownloaderAwarePriorityQueue 调度架构                        │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  第一层：Slot 选择（感知下载器负载）                                      │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │  输入：各 Slot 的活动下载数 stats = [(active, slot), ...]        │   │
+│  │                                                                 │   │
+│  │  策略1：优先选择 active 最小的 slot（负载均衡）                  │   │
+│  │  策略2：相同 active 时，Round-robin 风格选择（防饥饿）          │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                                    │                                      │
+│                                    ▼                                      │
+│  第二层：Slot 内部优先级调度（ScrapyPriorityQueue）                        │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │  选中的 slot 内部按优先级出队                                       │   │
+│  │  - 普通请求：LIFO 队列（DFS 风格）                                 │   │
+│  │  - 起始请求：FIFO 队列（顺序保证）                                 │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+##### 核心实现：`_next_slot` 方法的公平性与防饥饿
+
+```python
+# pqueues.py:358-383
+def _next_slot(self, stats: list[tuple[int, str]], *, update_state: bool) -> str:
+    last = self._last_selected_slot
+    min_active: int | None = None
+    best_slot: str | None = None
+    best_slot_after_last: str | None = None
+    
+    for active, slot in stats:
+        # ========== 策略1：选择 active 最小的 slot ==========
+        if min_active is None or active < min_active:
+            min_active = active
+            best_slot = slot
+            best_slot_after_last = None
+            # 记录在 last 之后的最小 active slot
+            if last is not None and slot > last:
+                best_slot_after_last = slot
+        
+        # ========== 策略2：相同 active 时的 Round-robin 选择 ==========
+        elif active == min_active:
+            # 字典序最小的 slot（作为默认选择）
+            if best_slot is None or slot < best_slot:
+                best_slot = slot
+            # Round-robin：选择在 last 之后的第一个 slot
+            if (
+                last is not None
+                and slot > last
+                and (best_slot_after_last is None or slot < best_slot_after_last)
+            ):
+                best_slot_after_last = slot
+    
+    # 优先选择 Round-robin 风格的 slot
+    slot = best_slot_after_last if best_slot_after_last is not None else best_slot
+    if update_state:
+        self._last_selected_slot = slot  # 更新上次选择，用于下次 Round-robin
+    return slot
+```
+
+##### 公平性与防饥饿的权衡分析
+
+**设计目标**：
+
+| 目标 | 实现机制 | 效果 |
+|------|----------|------|
+| **负载均衡** | 选择 `active` 最小的 slot | 下载器各 slot 压力均匀 |
+| **优先级保证** | slot 内部仍按优先级出队 | 高优先级请求仍优先处理 |
+| **防饥饿** | Round-robin 风格选择 | 相同负载的 slot 轮流出队 |
+| **确定性** | 字典序作为兜底选择 | 避免随机导致的不可预测 |
+
+**场景对比**：
+
+```
+场景：3 个域名，每个域名有 100 个请求，CONCURRENT_REQUESTS_PER_DOMAIN=2
+
+假设当前状态：
+- domain-a.com: active=2（已满）
+- domain-b.com: active=1
+- domain-c.com: active=1
+
+简单优先级调度（ScrapyPriorityQueue）：
+┌──────────────────────────────────────────────────────────────┐
+│  如果所有请求优先级相同，按入队顺序出队                        │
+│  问题：如果 domain-a 持续产生新请求，可能垄断调度              │
+│  后果：domain-b 和 domain-c 的请求可能被饿死                   │
+└──────────────────────────────────────────────────────────────┘
+
+感知负载调度（DownloaderAwarePriorityQueue）：
+┌──────────────────────────────────────────────────────────────┐
+│  第1次选择：domain-a active=2 > domain-b/c active=1          │
+│           → 选择 domain-b 或 domain-c（Round-robin）          │
+│                                                               │
+│  第2次选择：假设上次选了 domain-b                              │
+│           → 这次选 domain-c（Round-robin 保证）               │
+│                                                               │
+│  效果：domain-b 和 domain-c 轮流出队，直到它们的 active 达到 2 │
+│        此时才会选择 domain-a（如果它的 active 下降了）         │
+└──────────────────────────────────────────────────────────────┘
+```
+
+##### 权衡：复杂度 vs 公平性
+
+| 维度 | 简单优先级调度 | 感知负载调度 |
+|------|----------------|--------------|
+| **实现复杂度** | 低（单一层级） | 中（两级调度） |
+| **公平性** | 差（可能饿死） | 好（Slot 级别公平） |
+| **优先级保证** | 全局严格优先级 | Slot 内优先级 |
+| **适用场景** | 单域名爬取 | 多域名/广义爬取 |
+| **默认选择** | 否 | 是（Scrapy 默认） |
+
+**为什么 Scrapy 默认选择感知负载调度？**
+
+1. **广义爬取场景**：Scrapy 设计目标是支持多域名爬取，公平性是核心需求
+2. **下载器架构匹配**：下载器本身就是按 Slot（域名/IP）隔离的，调度器需要匹配这种架构
+3. **防反爬考虑**：均匀分配请求到各域名，降低单个域名被封禁的风险
+4. **可配置性**：用户可通过 `SCHEDULER_PRIORITY_QUEUE` 切换为简单优先级调度
+
+---
+
+#### 3.8.2 起始请求 FIFO 与普通请求 LIFO 的设计动机
+
+**为什么起始请求默认 FIFO，普通请求默认 LIFO？这两种顺序分别服务于什么爬取目标？**
+
+##### 两种请求的本质区别
+
+首先理解起始请求（Start Requests）与普通请求的差异：
+
+```python
+# 起始请求的标记机制：StartSpiderMiddleware
+# spidermiddlewares/start.py:26-31
+def get_processed_request(
+    self, request: Request, response: Response | None
+) -> Request | None:
+    # response is None 表示这是起始请求（没有前置响应）
+    if response is None:
+        request.meta.setdefault("is_start_request", True)
+    return request
+```
+
+| 特性 | 起始请求 | 普通请求 |
+|------|----------|----------|
+| **来源** | `start_urls` 或 `start_requests()` | 解析响应时产生的新请求 |
+| **数量** | 通常较少（几个到几十个） | 可能非常多（几万到几百万） |
+| **优先级** | 用户期望按定义顺序执行 | 按爬取策略动态调整 |
+| **生命周期** | 爬虫启动时一次性产生 | 持续产生直到爬取结束 |
+
+##### 普通请求 LIFO（栈）的设计动机
+
+```python
+# 默认配置：普通请求使用 LIFO 队列
+# default_settings.py:484-485
+SCHEDULER_MEMORY_QUEUE = "scrapy.squeues.LifoMemoryQueue"
+SCHEDULER_DISK_QUEUE = "scrapy.squeues.PickleLifoDiskQueue"
+```
+
+**LIFO = 深度优先搜索（DFS）**
+
+```
+爬取场景示例：一个页面包含多个链接
+
+          Page A (depth=0)
+              │
+        ┌─────┼─────┐
+        ▼     ▼     ▼
+      Page B  Page C  Page D (depth=1)
+        │
+   ┌────┼────┐
+   ▼    ▼    ▼
+ Page E  Page F  Page G (depth=2)
+
+LIFO 顺序（后进先出）：
+入队顺序：A → B → C → D
+出队顺序：D → C → B → E → F → G
+
+爬取路径：A → D → 返回 → C → 返回 → B → E → F → G
+         ↑ 深度优先，先深入一个分支再回溯
+```
+
+**LIFO 的优势与适用场景**：
+
+| 优势 | 说明 |
+|------|------|
+| **内存效率** | 尽快完成单个分支，减少内存中待处理请求数 |
+| **深度优先** | 符合典型爬虫需求：先完整爬取一个页面的所有链接 |
+| **局部性原理** | 相同域名/目录的请求连续处理，可能提高缓存命中率 |
+| **快速产出** | 较早开始解析深层页面，Item 产出更均匀 |
+
+**配置为 BFS（FIFO）的场景**：
+
+```python
+# 文档中推荐的 BFS 配置
+# scheduler.py 注释中的说明：
+# 如果你想按广度优先（BFO）爬取，需要设置：
+DEPTH_PRIORITY = 1
+SCHEDULER_DISK_QUEUE = "scrapy.squeues.PickleFifoDiskQueue"
+SCHEDULER_MEMORY_QUEUE = "scrapy.squeues.FifoMemoryQueue"
+```
+
+**BFS 的适用场景**：
+- 需要按层级收集数据（如先爬取所有一级页面）
+- 深度限制敏感的爬取
+- 种子页面分散，需要均匀覆盖
+
+##### 起始请求 FIFO（队列）的设计动机
+
+```python
+# 默认配置：起始请求使用 FIFO 队列
+# default_settings.py:486-487
+SCHEDULER_START_MEMORY_QUEUE = "scrapy.squeues.FifoMemoryQueue"
+SCHEDULER_START_DISK_QUEUE = "scrapy.squeues.PickleFifoDiskQueue"
+```
+
+**FIFO = 先进先出，顺序保证**
+
+```
+用户期望的行为：
+
+class MySpider(scrapy.Spider):
+    name = 'my_spider'
+    start_urls = [
+        'https://example.com/page1',  # 期望先处理
+        'https://example.com/page2',
+        'https://example.com/page3',   # 期望后处理
+    ]
+
+FIFO 保证：page1 → page2 → page3（按定义顺序）
+LIFO 可能导致：page3 → page2 → page1（逆序）
+```
+
+**起始请求 FIFO 的设计考虑**：
+
+| 考虑因素 | 说明 |
+|----------|------|
+| **用户意图** | `start_urls` 列表的顺序通常表达了用户的优先级意图 |
+| **可预测性** | 顺序执行便于调试和理解爬虫行为 |
+| **依赖关系** | 某些场景下，起始请求之间可能存在隐含依赖 |
+| **数量较少** | 起始请求通常数量有限，顺序调度的开销可忽略 |
+
+##### 优先级队列中的特殊处理
+
+`ScrapyPriorityQueue` 对起始请求有独立的队列管理：
+
+```python
+# pqueues.py:169-182
+def push(self, request: Request) -> None:
+    priority = self.priority(request)
+    is_start_request = request.meta.get("is_start_request", False)
+    
+    # 起始请求使用独立的队列系统
+    if is_start_request and self._start_queue_cls:
+        if priority not in self._start_queues:
+            self._start_queues[priority] = self._sqfactory(priority)
+        q = self._start_queues[priority]
+    else:
+        if priority not in self.queues:
+            self.queues[priority] = self.qfactory(priority)
+        q = self.queues[priority]
+    
+    q.push(request)
+    # 更新当前最高优先级
+    if self.curprio is None or priority < self.curprio:
+        self.curprio = priority
+```
+
+**出队时的优先级**：
+
+```python
+# pqueues.py:184-212
+def pop(self) -> Request | None:
+    while self.curprio is not None:
+        # 先尝试普通请求队列
+        try:
+            q = self.queues[self.curprio]
+        except KeyError:
+            pass
+        else:
+            m = q.pop()
+            if not q:
+                del self.queues[self.curprio]
+                q.close()
+                if not self._start_queues:
+                    self._update_curprio()
+            return m  # 普通请求优先出队
+        
+        # 普通请求队列为空时，才尝试起始请求队列
+        if self._start_queues:
+            try:
+                q = self._start_queues[self.curprio]
+            except KeyError:
+                self._update_curprio()
+            else:
+                m = q.pop()
+                if not q:
+                    del self._start_queues[self.curprio]
+                    q.close()
+                    self._update_curprio()
+                return m
+        else:
+            self._update_curprio()
+    return None
+```
+
+**关键设计**：
+1. **同一优先级内，普通请求优先于起始请求**
+2. **起始请求有独立的 FIFO 队列，保证顺序**
+3. **普通请求使用 LIFO 队列，实现 DFS**
+
+##### 设计决策的权衡总结
+
+| 决策维度 | 普通请求 | 起始请求 |
+|----------|----------|----------|
+| **队列顺序** | LIFO（栈） | FIFO（队列） |
+| **爬取策略** | 深度优先（DFS） | 顺序保证 |
+| **设计目标** | 内存效率、快速深入 | 可预测性、用户意图 |
+| **数量特性** | 大量、动态产生 | 少量、一次性 |
+| **优先级行为** | 与普通请求竞争 | 同一优先级内靠后 |
+
+**用户视角的设计哲学**：
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    Scrapy 队列策略的用户体验设计                       │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  起始请求（Start Requests）：                                        │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  用户定义：start_urls = [url1, url2, url3]                  │   │
+│  │  用户期望：按定义顺序执行，便于理解和调试                      │   │
+│  │  设计选择：FIFO + 独立队列 + 同一优先级内靠后                  │   │
+│  │  理由：数量少，顺序重要，不应该影响动态爬取流程                 │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+│  普通请求（Normal Requests）：                                       │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │  来源：解析响应时动态产生                                       │   │
+│  │  特点：数量大，构成爬取树                                       │   │
+│  │  设计选择：LIFO（DFS）+ 优先级调度                             │   │
+│  │  理由：内存效率高，符合典型爬取场景（先深入一个分支）           │   │
+│  │  可配置：用户可切换为 FIFO（BFS）以适应特殊需求                 │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
 ---
 
 ## 4. Crawler 对象整合机制
