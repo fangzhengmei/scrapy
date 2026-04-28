@@ -757,7 +757,621 @@ def _adjust_delay(self, slot: Slot, latency: float, response: Response) -> None:
 | 默认中间件配置 | `scrapy/settings/default_settings.py` | 283-301 |
 | 异常定义 | `scrapy/exceptions.py` | 32-33 (IgnoreRequest) |
 
+## 8. 异步下载器的请求并发协调核心路径
+
+### 8.1 回调与错误回调机制概述
+
+Scrapy 异步下载器采用 **Deferred（Twisted）+ async/await 混合模式** 实现异步协调。核心机制是通过 `Deferred` 对象作为"承诺"，在入队时创建并等待，在下载完成/失败时通过回调/错误回调触发结果。
+
+### 8.2 关键数据结构与桥接机制
+
+#### Deferred 对象的创建与等待
+
+```python
+async def _enqueue_request(self, request: Request) -> Response:
+    key, slot = self._get_slot(request)
+    request.meta[self.DOWNLOAD_SLOT] = key
+    slot.active.add(request)
+    self.signals.send_catch_log(
+        signal=signals.request_reached_downloader,
+        request=request,
+        spider=self.crawler.spider,
+    )
+    d: Deferred[Response] = Deferred()  # 1. 创建 Deferred 承诺对象
+    slot.queue.append((request, d))      # 2. 将 (request, deferred) 入队
+    self._process_queue(slot)            # 3. 触发队列处理
+    try:
+        return await maybe_deferred_to_future(d)  # 4. 等待 Deferred 结果（桥接 asyncio）
+    finally:
+        slot.active.remove(request)
+```
+[__init__.py:176-191](file:///g:/fangzheng/solo-dogfeeding/code/scrapy-8941/scrapy/core/downloader/__init__.py#L176-L191)
+
+**关键设计点**：
+1. **Deferred 作为桥梁**：`Deferred` 对象在入队时创建，连接了"请求入队等待"和"下载完成通知"两个阶段
+2. **asyncio 桥接**：`maybe_deferred_to_future(d)` 将 Twisted 的 `Deferred` 转换为 asyncio 的 `Future`，使代码可以用 `await` 等待
+3. **finally 保证清理**：无论成功或失败，`slot.active.remove(request)` 都会执行
+
+### 8.3 下载成功分支路径
+
+#### 完整成功流程
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  1. _process_queue 取出请求                                                    │
+│     request, queue_dfd = slot.queue.popleft()                                │
+│     _schedule_coro(_wait_for_download(slot, request, queue_dfd))            │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  2. _wait_for_download 执行                                                    │
+│     ┌─────────────────────────────────────────────────────────────────────┐  │
+│     │ async def _wait_for_download(                                        │  │
+│     │     self, slot: Slot, request: Request, queue_dfd: Deferred[Response]│  │
+│     │ ) -> None:                                                            │  │
+│     │     try:                                                              │  │
+│     │         response = await self._download(slot, request)  ◀── 调用下载 │  │
+│     │     except Exception:                                                 │  │
+│     │         queue_dfd.errback(Failure())      ◀── 失败分支               │  │
+│     │     else:                                                             │  │
+│     │         queue_dfd.callback(response)       ◀── 成功分支               │  │
+│     └─────────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  3. _download 内部执行（成功时）                                                │
+│     async def _download(self, slot: Slot, request: Request) -> Response:     │
+│         slot.transferring.add(request)           ◀── 标记为传输中             │
+│         try:                                                                   │
+│             response: Response = await self.handlers.download_request_async(  │
+│                 request                                                        │
+│             )                                                                  │
+│             # 发送 response_downloaded 信号                                    │
+│             self.signals.send_catch_log(                                      │
+│                 signal=signals.response_downloaded,                           │
+│                 response=response,                                             │
+│                 request=request,                                               │
+│                 spider=self.crawler.spider,                                    │
+│             )                                                                  │
+│             return response                      ◀── 返回 Response             │
+│         except Exception:                                                      │
+│             await _defer_sleep_async()                                         │
+│             raise                                                              │
+│         finally:                                                               │
+│             slot.transferring.remove(request)    ◀── 从传输中移除             │
+│             self._process_queue(slot)            ◀── 继续处理队列             │
+│             self.signals.send_catch_log(                                      │
+│                 signal=signals.request_left_downloader,                       │
+│                 request=request,                                               │
+│                 spider=self.crawler.spider,                                    │
+│             )                                                                  │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  4. 回调触发与结果传递                                                          │
+│     queue_dfd.callback(response)  ◀── Deferred 被 resolve                    │
+│              │                                                                  │
+│              ▼                                                                  │
+│     _enqueue_request 中的 await maybe_deferred_to_future(d) 获得结果         │
+│              │                                                                  │
+│              ▼                                                                  │
+│     finally 块执行: slot.active.remove(request)                               │
+│              │                                                                  │
+│              ▼                                                                  │
+│     Response 返回给上层（中间件 process_response 链）                          │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 8.4 下载失败分支路径
+
+#### 完整失败流程
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  1. 下载过程中抛出异常                                                          │
+│     在 _download 中:                                                           │
+│     response: Response = await self.handlers.download_request_async(request) │
+│     ──▶ 抛出异常（如网络错误、超时、连接被拒等）                                │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  2. _download 的异常处理                                                        │
+│     async def _download(self, slot: Slot, request: Request) -> Response:     │
+│         slot.transferring.add(request)                                         │
+│         try:                                                                   │
+│             response: Response = await self.handlers.download_request_async(  │
+│                 request                                                        │
+│             )                                                                  │
+│             # ... 成功逻辑                                                      │
+│             return response                                                    │
+│         except Exception:                      ◀── 捕获异常                    │
+│             await _defer_sleep_async()         ◀── 异步让步（允许事件循环处理）│
+│             raise                               ◀── 重新抛出异常               │
+│         finally:                                                               │
+│             slot.transferring.remove(request)    ◀── 仍然执行！释放槽位       │
+│             self._process_queue(slot)            ◀── 仍然执行！继续处理队列   │
+│             self.signals.send_catch_log(                                      │
+│                 signal=signals.request_left_downloader,                       │
+│                 request=request,                                               │
+│                 spider=self.crawler.spider,                                    │
+│             )                                                                  │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  3. _wait_for_download 的错误回调                                               │
+│     async def _wait_for_download(                                              │
+│         self, slot: Slot, request: Request, queue_dfd: Deferred[Response]    │
+│     ) -> None:                                                                 │
+│         try:                                                                   │
+│             response = await self._download(slot, request)                    │
+│         except Exception:                      ◀── 捕获来自 _download 的异常   │
+│             queue_dfd.errback(Failure())        ◀── 触发错误回调              │
+│         else:                                                                   │
+│             queue_dfd.callback(response)                                       │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  4. 错误回调触发与异常传播                                                      │
+│     queue_dfd.errback(Failure())  ◀── Deferred 被 reject（包装为 Failure）   │
+│              │                                                                  │
+│              ▼                                                                  │
+│     _enqueue_request 中的 await maybe_deferred_to_future(d)                   │
+│     ──▶ 抛出原始异常（Failure 被解包）                                          │
+│              │                                                                  │
+│              ▼                                                                  │
+│     finally 块仍然执行: slot.active.remove(request)                           │
+│              │                                                                  │
+│              ▼                                                                  │
+│     异常向上传播到:                                                             │
+│     ┌─────────────────────────────────────────────────────────────────────┐  │
+│     │ middleware.py 中的 download_async()                                   │  │
+│     │ try:                                                                   │  │
+│     │     result = await process_request(request)                           │  │
+│     │ except Exception as ex:                                               │  │
+│     │     result = await process_exception(ex)  ◀── 进入异常处理链         │  │
+│     │ return await process_response(result)                                 │  │
+│     └─────────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 8.5 成功与失败路径的关键差异对比
+
+| 对比项 | 成功路径 | 失败路径 |
+|--------|----------|----------|
+| **回调类型** | `queue_dfd.callback(response)` | `queue_dfd.errback(Failure())` |
+| **_download 返回值** | `return response` | `raise Exception`（finally 仍执行） |
+| **_wait_for_download 行为** | `else` 分支执行 callback | `except` 分支执行 errback |
+| **Deferred 状态** | Resolved（已解决） | Rejected（已拒绝） |
+| **await 结果** | 返回 Response 对象 | 抛出原始异常 |
+| **finally 执行** | ✅ 是（移除 active） | ✅ 是（移除 active） |
+| **finally（_download）** | ✅ 是（释放 transferring、处理队列） | ✅ 是（释放 transferring、处理队列） |
+| **后续处理** | 进入 `process_response` 链 | 进入 `process_exception` 链 |
+
+### 8.6 关键设计要点分析
+
+#### 1. finally 块的双重保障
+
+**在 `_download` 的 finally 块中**：
+```python
+finally:
+    slot.transferring.remove(request)  # 1. 释放传输槽位
+    self._process_queue(slot)           # 2. 继续处理队列中的下一个请求
+    self.signals.send_catch_log(...)    # 3. 发送信号
+```
+[__init__.py:239-250](file:///g:/fangzheng/solo-dogfeeding/code/scrapy-8941/scrapy/core/downloader/__init__.py#L239-L250)
+
+**设计意图**：
+- 无论下载成功或失败，**必须释放传输槽位**，否则该 Slot 的并发数会被"卡住"
+- 无论成功或失败，**必须继续处理队列**，否则后续请求会被永久阻塞
+
+#### 2. Failure 包装与解包
+
+```python
+from twisted.python.failure import Failure
+
+# _wait_for_download 中
+except Exception:
+    queue_dfd.errback(Failure())  # 将异常包装为 Failure 对象
+```
+[__init__.py:257-258](file:///g:/fangzheng/solo-dogfeeding/code/scrapy-8941/scrapy/core/downloader/__init__.py#L257-L258)
+
+**Twisted Failure 的作用**：
+- 捕获异常的完整堆栈信息
+- 允许在异步回调链中传递异常
+- `maybe_deferred_to_future` 会将 Failure 解包为原始异常重新抛出
+
+#### 3. 异步让步 `_defer_sleep_async()`
+
+```python
+# _download 中
+except Exception:
+    await _defer_sleep_async()  # 异步让步
+    raise
+```
+[__init__.py:236-238](file:///g:/fangzheng/solo-dogfeeding/code/scrapy-8941/scrapy/core/downloader/__init__.py#L236-L238)
+
+**设计意图**：
+- 在异常抛出前给事件循环一个处理其他任务的机会
+- 防止异常处理链阻塞事件循环
+- 这是 Scrapy 异步框架中的一种"友好让步"模式
+
+## 9. 下载槽的生命周期管理
+
+### 9.1 下载槽（Slot）的生命周期概述
+
+下载槽的完整生命周期包括以下阶段：
+
+```
+┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+│   创建阶段    │───▶│   使用阶段    │───▶│   空闲阶段    │───▶│   销毁阶段    │
+│  (Create)    │    │   (Active)   │    │   (Idle)     │    │  (Destroy)   │
+└──────────────┘    └──────────────┘    └──────────────┘    └──────────────┘
+       │                   │                   │                   │
+       ▼                   ▼                   ▼                   ▼
+  首次请求该域名/IP   处理请求队列         无活跃请求         满足 GC 条件
+  _get_slot() 创建    transferring>0     active=空           被 _slot_gc() 清理
+```
+
+### 9.2 下载槽的创建时机
+
+#### 创建触发条件
+
+下载槽在**首次请求某域名/IP时**创建，且采用**惰性创建**策略：
+
+```python
+def _get_slot(
+    self, request: Request, spider: Spider | None = None
+) -> tuple[str, Slot]:
+    key = self.get_slot_key(request)
+    if key not in self.slots:  # 槽不存在时才创建
+        assert self.crawler.spider
+        slot_settings = self.per_slot_settings.get(key, {})
+        
+        # 1. 确定并发数和延迟
+        conc = self.ip_concurrency or self.domain_concurrency
+        conc, delay = _get_concurrency_delay(
+            conc, self.crawler.spider, self.settings
+        )
+        
+        # 2. 应用 per-slot 自定义配置
+        conc, delay = (
+            slot_settings.get("concurrency", conc),
+            slot_settings.get("delay", delay),
+        )
+        randomize_delay = slot_settings.get("randomize_delay", self.randomize_delay)
+        
+        # 3. 创建 Slot 实例
+        new_slot = Slot(conc, delay, randomize_delay)
+        self.slots[key] = new_slot
+        
+        # 4. 启动 GC 循环（只在创建第一个槽时启动）
+        self._start_slot_gc()
+
+    return key, self.slots[key]
+```
+[__init__.py:142-163](file:///g:/fangzheng/solo-dogfeeding/code/scrapy-8941/scrapy/core/downloader/__init__.py#L142-L163)
+
+#### Slot Key 的确定规则
+
+```python
+def get_slot_key(self, request: Request) -> str:
+    # 1. 优先使用 request.meta 中指定的自定义 slot
+    if (meta_slot := request.meta.get(self.DOWNLOAD_SLOT)) is not None:
+        return meta_slot
+
+    # 2. 默认使用域名作为 key
+    key = urlparse_cached(request).hostname or ""
+    
+    # 3. 如果配置了 IP 并发，使用 DNS 缓存中的 IP 作为 key
+    if self.ip_concurrency:
+        key = dnscache.get(key, key)
+
+    return key
+```
+[__init__.py:165-173](file:///g:/fangzheng/solo-dogfeeding/code/scrapy-8941/scrapy/core/downloader/__init__.py#L165-L173)
+
+### 9.3 定时清理循环的启动与停止
+
+#### GC 循环的启动时机
+
+```python
+def _start_slot_gc(self) -> None:
+    if self._slot_gc_loop:  # 防止重复启动
+        return
+    # 创建定时循环调用
+    self._slot_gc_loop = create_looping_call(self._slot_gc)
+    # 启动循环，间隔 60 秒，now=False 表示不立即执行
+    self._slot_gc_loop.start(self._SLOT_GC_INTERVAL, now=False)
+```
+[__init__.py:273-277](file:///g:/fangzheng/solo-dogfeeding/code/scrapy-8941/scrapy/core/downloader/__init__.py#L273-L277)
+
+**关键配置**：
+```python
+class Downloader:
+    DOWNLOAD_SLOT = "download_slot"
+    _SLOT_GC_INTERVAL: float = 60.0  # GC 间隔：60 秒
+```
+[__init__.py:100-101](file:///g:/fangzheng/solo-dogfeeding/code/scrapy-8941/scrapy/core/downloader/__init__.py#L100-L101)
+
+**启动时机**：
+- **只在创建第一个 Slot 时启动**一次
+- 后续创建其他 Slot 时，`_slot_gc_loop` 已存在，直接返回
+
+#### GC 循环的停止时机
+
+```python
+def _stop_slot_gc(self) -> None:
+    if self._slot_gc_loop:
+        self._slot_gc_loop.stop()  # 停止循环调用
+        self._slot_gc_loop = None   # 置空标记
+```
+[__init__.py:279-282](file:///g:/fangzheng/solo-dogfeeding/code/scrapy-8941/scrapy/core/downloader/__init__.py#L279-L282)
+
+**调用场景**：在 `Downloader.close()` 中被调用：
+
+```python
+def close(self) -> None:
+    self._stop_slot_gc()           # 1. 先停止 GC 循环
+    for slot in self.slots.values():
+        slot.close()                # 2. 关闭所有剩余的 Slot
+```
+[__init__.py:262-265](file:///g:/fangzheng/solo-dogfeeding/code/scrapy-8941/scrapy/core/downloader/__init__.py#L262-L265)
+
+### 9.4 槽的清理触发条件（GC 逻辑）
+
+#### 核心 GC 算法
+
+```python
+def _slot_gc(self, age: float = 60) -> None:
+    mintime = time() - age  # 当前时间 - 60秒
+    for key, slot in list(self.slots.items()):  # 遍历所有槽（list 防止迭代时修改）
+        # 两个条件必须同时满足：
+        # 1. not slot.active - 没有活跃请求
+        # 2. slot.lastseen + slot.delay < mintime - 最后活动时间 + 延迟 < (当前时间 - 60秒)
+        if not slot.active and slot.lastseen + slot.delay < mintime:
+            self.slots.pop(key).close()  # 从字典移除并关闭
+```
+[__init__.py:267-271](file:///g:/fangzheng/solo-dogfeeding/code/scrapy-8941/scrapy/core/downloader/__init__.py#L267-L271)
+
+#### GC 触发条件详解
+
+| 条件 | 含义 | 目的 |
+|------|------|------|
+| `not slot.active` | `slot.active` 集合为空 | 确保没有请求正在等待该槽的处理结果 |
+| `slot.lastseen + slot.delay < mintime` | 最后活动时间 + 延迟 < 当前时间 - 60秒 | 确保槽已经"足够空闲"一段时间 |
+
+**时间条件的精确计算**：
+```
+假设当前时间是 T，slot.delay = 2 秒
+
+mintime = T - 60
+
+条件：slot.lastseen + 2 < T - 60
+即：   slot.lastseen < T - 62
+
+含义：该槽最后一次活动是在 62 秒之前
+```
+
+**为什么要加上 `slot.delay`？**
+- 如果配置了 `DOWNLOAD_DELAY`，请求之间本身就有间隔
+- 加上 `slot.delay` 可以防止"刚好在延迟期间"的槽被误回收
+- 例如：如果 `delay=5`，即使 61 秒没活动，`61 - 5 = 56 < 60`，不满足条件，不会被回收
+
+### 9.5 槽关闭时的资源释放流程
+
+#### Slot.close() 方法
+
+```python
+@dataclass(slots=True, eq=False)
+class Slot:
+    # ... 其他字段
+    latercall: CallLaterResult | None = field(default=None, init=False, repr=False)
+
+    def close(self) -> None:
+        if self.latercall:
+            self.latercall.cancel()  # 取消待执行的延迟调用
+            self.latercall = None
+```
+[__init__.py:58-71](file:///g:/fangzheng/solo-dogfeeding/code/scrapy-8941/scrapy/core/downloader/__init__.py#L58-L71)
+
+#### latercall 的来源与作用
+
+`latercall` 在 `_process_queue` 中设置，用于实现下载延迟：
+
+```python
+def _process_queue(self, slot: Slot) -> None:
+    if slot.latercall:
+        return  # 如果有延迟调用待执行，阻塞处理
+
+    now = time()
+    delay = slot.download_delay()
+    if delay:
+        penalty = delay - now + slot.lastseen
+        if penalty > 0:
+            # 设置延迟调用，penalty 秒后调用 _latercall
+            slot.latercall = call_later(penalty, self._latercall, slot)
+            return
+    # ... 处理队列
+```
+[__init__.py:193-205](file:///g:/fangzheng/solo-dogfeeding/code/scrapy-8941/scrapy/core/downloader/__init__.py#L193-L205)
+
+```python
+def _latercall(self, slot: Slot) -> None:
+    slot.latercall = None  # 执行后清空
+    self._process_queue(slot)  # 继续处理队列
+```
+[__init__.py:217-219](file:///g:/fangzheng/solo-dogfeeding/code/scrapy-8941/scrapy/core/downloader/__init__.py#L217-L219)
+
+#### 资源释放的完整性
+
+当槽被关闭时，需要释放的资源：
+
+| 资源类型 | 释放方式 | 未释放的后果 |
+|----------|----------|--------------|
+| `latercall`（延迟调用） | `self.latercall.cancel()` | 延迟调用到时后可能访问已销毁的 Slot，导致异常 |
+| `slots` 字典中的引用 | `self.slots.pop(key)` | 内存泄漏，Slot 对象无法被 GC |
+
+**注意**：Slot 中的其他集合（`active`, `queue`, `transferring`）在关闭时不需要显式清空，因为：
+1. GC 条件已保证 `not slot.active`（active 为空）
+2. 如果 `slot.active` 为空，说明没有请求在等待 `queue` 中的结果
+3. `transferring` 中的请求会在完成/失败时自动移除
+
+### 9.6 完整生命周期流程图
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         下载槽完整生命周期                                      │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 阶段 1: 创建                                                                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                                │
+│   1. 首次请求某域名/IP                                                          │
+│      └──▶ _get_slot(request) 被调用                                           │
+│                                                                                │
+│   2. key 不存在于 self.slots                                                    │
+│      └──▶ 创建新 Slot(concurrency, delay, randomize_delay)                   │
+│      └──▶ self.slots[key] = new_slot                                          │
+│                                                                                │
+│   3. 如果是第一个 Slot                                                          │
+│      └──▶ _start_slot_gc() 启动定时 GC 循环（每 60 秒）                       │
+│                                                                                │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 阶段 2: 使用（活跃）                                                           │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                                │
+│   请求入队:                                                                    │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │ _enqueue_request(request):                                            │   │
+│   │   slot.active.add(request)              ◀── 添加到活跃集合            │   │
+│   │   slot.queue.append((request, d))      ◀── 加入队列                 │   │
+│   │   _process_queue(slot)                   ◀── 触发处理                 │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                                │
+│   队列处理:                                                                    │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │ _process_queue(slot):                                                 │   │
+│   │   if slot.latercall: return           ◀── 有延迟则等待               │   │
+│   │                                                                        │   │
+│   │   delay = slot.download_delay()                                        │   │
+│   │   if delay > 0:                                                        │   │
+│   │       penalty = delay - now + slot.lastseen                            │   │
+│   │       if penalty > 0:                                                  │   │
+│   │           slot.latercall = call_later(penalty, _latercall, slot)     │   │
+│   │           return                       ◀── 设置延迟，稍后处理           │   │
+│   │                                                                        │   │
+│   │   while slot.queue and slot.free_transfer_slots() > 0:              │   │
+│   │       slot.lastseen = now              ◀── 更新最后活动时间            │   │
+│   │       request, dfd = slot.queue.popleft()                             │   │
+│   │       _schedule_coro(_wait_for_download(slot, request, dfd))         │   │
+│   │                                                                        │   │
+│   │       if delay:                        ◀── 有延迟则防止突发             │   │
+│   │           _process_queue(slot)         ◀── 递归调用一次               │   │
+│   │           break                        ◀── 然后 break                  │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                                │
+│   下载执行:                                                                    │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │ _download(slot, request):                                             │   │
+│   │   slot.transferring.add(request)       ◀── 标记为传输中              │   │
+│   │   try:                                                                 │   │
+│   │       response = await handlers.download_request_async(request)       │   │
+│   │       signals.send(response_downloaded)                                │   │
+│   │       return response                                                  │   │
+│   │   except Exception:                                                    │   │
+│   │       await _defer_sleep_async()                                       │   │
+│   │       raise                                                            │   │
+│   │   finally:                                                             │   │
+│   │       slot.transferring.remove(request) ◀── 释放传输槽位              │   │
+│   │       self._process_queue(slot)         ◀── 继续处理队列              │   │
+│   │       signals.send(request_left_downloader)                            │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                                │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 阶段 3: 空闲                                                                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                                │
+│   当所有请求处理完成后：                                                        │
+│   - slot.active 变为空（所有等待的请求都已返回）                               │
+│   - slot.queue 可能为空或有新请求（如果有新请求进来）                           │
+│   - slot.transferring 变为空（所有传输都已完成）                               │
+│                                                                                │
+│   如果长时间没有新请求：                                                        │
+│   - slot.lastseen 不再更新                                                     │
+│   - 进入"潜在可回收"状态                                                       │
+│                                                                                │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 阶段 4: 销毁（GC）                                                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                                │
+│   GC 循环触发（每 60 秒）:                                                     │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │ _slot_gc(age=60):                                                     │   │
+│   │   mintime = time() - 60                                               │   │
+│   │                                                                        │   │
+│   │   for key, slot in list(self.slots.items()):                          │   │
+│   │       # 检查两个条件：                                                  │   │
+│   │       # 1. not slot.active          ◀── 没有活跃请求                  │   │
+│   │       # 2. slot.lastseen + slot.delay < mintime                      │   │
+│   │       #    即：最后活动时间 + 延迟 < (当前时间 - 60秒)                │   │
+│   │                                                                        │   │
+│   │       if not slot.active and slot.lastseen + slot.delay < mintime:   │   │
+│   │           self.slots.pop(key).close()  ◀── 移除并关闭                │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                                │
+│   Slot 关闭时的资源释放:                                                       │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │ Slot.close():                                                         │   │
+│   │   if self.latercall:                                                  │   │
+│   │       self.latercall.cancel()           ◀── 取消待执行的延迟调用      │   │
+│   │       self.latercall = None                                            │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                                │
+│   下载器关闭时的清理:                                                          │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │ Downloader.close():                                                   │   │
+│   │   self._stop_slot_gc()                  ◀── 停止 GC 循环              │   │
+│   │   for slot in self.slots.values():                                    │   │
+│   │       slot.close()                      ◀── 关闭所有剩余 Slot          │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                                │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 9.7 关键代码位置索引（补充）
+
+| 功能 | 文件位置 | 关键行号 |
+|------|----------|----------|
+| Slot 创建逻辑 | `scrapy/core/downloader/__init__.py` | 142-163 |
+| Slot Key 确定 | `scrapy/core/downloader/__init__.py` | 165-173 |
+| Slot.close() 方法 | `scrapy/core/downloader/__init__.py` | 68-71 |
+| GC 循环启动 | `scrapy/core/downloader/__init__.py` | 273-277 |
+| GC 循环停止 | `scrapy/core/downloader/__init__.py` | 279-282 |
+| GC 核心逻辑 | `scrapy/core/downloader/__init__.py` | 267-271 |
+| 下载器 close() | `scrapy/core/downloader/__init__.py` | 262-265 |
+| 成功回调 | `scrapy/core/downloader/__init__.py` | 259-260 |
+| 错误回调 | `scrapy/core/downloader/__init__.py` | 257-258 |
+| _wait_for_download | `scrapy/core/downloader/__init__.py` | 252-260 |
+| _download  finally | `scrapy/core/downloader/__init__.py` | 239-250 |
+
 ---
 
 *报告生成时间: 2026-04-28*
 *分析基于 Scrapy 源代码版本: 本地仓库版本*
+*最后更新: 2026-04-28（新增第 8、9 章）*
