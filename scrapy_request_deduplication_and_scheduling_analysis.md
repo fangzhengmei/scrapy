@@ -40,7 +40,9 @@ def fingerprint(
 
 ### 1.2 URL 标准化（核心步骤）
 
-请求指纹的关键在于 **URL 标准化**，通过 `w3lib.url.canonicalize_url` 函数实现。这一步确保以下 URL 变体被视为相同：
+请求指纹的关键在于 **URL 标准化**，通过 `w3lib.url.canonicalize_url` 函数实现。这是一个多步骤的规范化过程，确保语义等价的 URL 生成相同的指纹。
+
+#### 1.2.1 已覆盖的标准化规则
 
 | 原始 URL | 标准化后 | 说明 |
 |---------|---------|------|
@@ -48,6 +50,136 @@ def fingerprint(
 | `http://example.com/page#section` | `http://example.com/page` | 默认忽略 URL 片段 |
 | `http://Example.COM/path` | `http://example.com/path` | 域名小写化 |
 | `http://example.com:80/path` | `http://example.com/path` | 默认端口省略 |
+
+#### 1.2.2 百分号编码归一化（关键补充）
+
+百分号编码的不一致是导致重复请求漏检的常见原因。`w3lib.url.canonicalize_url` 会执行以下归一化处理：
+
+**1. 百分号编码大小写统一**
+
+所有百分号编码序列统一转换为大写十六进制：
+
+| 原始形式 | 归一化后 | 说明 |
+|---------|---------|------|
+| `%2f` | `%2F` | 小写转大写 |
+| `%3a` | `%3A` | 冒号编码归一化 |
+| `http://example.com/%61%62%63` | `http://example.com/abc` | 可打印 ASCII 字符解码（如 `%61`='a'） |
+
+**实现原理**（基于 w3lib 源码分析）：
+```
+1. 解码路径中的百分号编码序列为 UTF-8（或保持原始字节）
+2. 使用 `urllib.parse.quote` 重新编码
+3. quote 函数默认生成大写的 %XX 序列
+```
+
+这确保了 `http://example.com/path%2fname` 和 `http://example.com/path%2Fname` 生成相同指纹。
+
+**2. 查询参数中空格的等价性处理**
+
+在查询参数中，空格有两种表示方式：`%20` 和 `+`。`canonicalize_url` 会将它们统一规范化：
+
+| 原始 URL | 规范化后 | 说明 |
+|---------|---------|------|
+| `http://example.com?q=hello%20world` | `http://example.com?q=hello+world` | `%20` → `+` |
+| `http://example.com?q=hello+world` | `http://example.com?q=hello+world` | 保持 `+` 形式 |
+
+**注意**：这种规范化仅适用于**查询参数**部分。路径部分的空格（`%20`）不会被转换为 `+`，因为 `+` 在路径中没有特殊含义。
+
+#### 1.2.3 路径规范化（关键补充）
+
+路径中的冗余点段和多余斜杠如果不处理，会导致语义相同的 URL 被视为不同。
+
+**1. 多余斜杠的处理**
+
+| 原始 URL | 规范化后 | 说明 |
+|---------|---------|------|
+| `http://example.com//path//to//page` | `http://example.com/path/to/page` | 合并连续斜杠 |
+| `http://example.com/path/` | `http://example.com/path/` | 尾斜杠保持（与服务器行为一致） |
+
+**2. 点段解析（. 和 ..）**
+
+根据 RFC 3986 Section 5.2.4 "Remove Dot Segments" 算法，路径中的 `.`（当前目录）和 `..`（父目录）会被解析：
+
+| 原始 URL | 规范化后 | 说明 |
+|---------|---------|------|
+| `http://example.com/a/./b/./c` | `http://example.com/a/b/c` | 移除 `.` 段 |
+| `http://example.com/a/b/../c` | `http://example.com/a/c` | 解析 `..` 段 |
+| `http://example.com/a/../../x` | `http://example.com/x` | 多级父目录解析 |
+| `http://example.com/../x` | `http://example.com/x` | 根目录的 `..` 被忽略 |
+
+**实现机制**：
+w3lib 使用 `posixpath.normpath` 或类似算法来规范化路径，确保：
+- `.` 段被移除
+- `..` 段与其前一个段一起被移除
+- 连续的斜杠被合并为单个斜杠
+
+#### 1.2.4 综合示例
+
+以下是一个综合的 URL 标准化示例：
+
+| 阶段 | URL |
+|-----|-----|
+| 原始 | `http://EXAMPLE.COM:80/a/./b/../c%2fd?q=hello%20world&x=1#frag` |
+| 域名小写 + 端口移除 | `http://example.com/a/./b/../c%2fd?q=hello%20world&x=1#frag` |
+| 路径规范化（点段 + 斜杠） | `http://example.com/a/c%2fd?q=hello%20world&x=1#frag` |
+| 百分号编码归一化 | `http://example.com/a/c%2Fd?q=hello%20world&x=1#frag` |
+| 查询参数空格规范化 | `http://example.com/a/c%2Fd?q=hello+world&x=1#frag` |
+| 查询参数排序 | `http://example.com/a/c%2Fd?q=hello+world&x=1#frag`（已有序） |
+| 移除片段 | `http://example.com/a/c%2Fd?q=hello+world&x=1` |
+
+**最终标准化结果**：`http://example.com/a/c%2Fd?q=hello+world&x=1`
+
+#### 1.2.5 对指纹判断的影响
+
+这些标准化步骤直接决定了两个 URL 是否会被视为"相同"请求：
+
+**场景 1：编码大小写差异**
+```python
+r1 = Request("http://example.com/path%2fname")  # %2f（小写）
+r2 = Request("http://example.com/path%2Fname")  # %2F（大写）
+# 标准化后相同 → 指纹相同 → 被过滤
+```
+
+**场景 2：查询参数空格差异**
+```python
+r1 = Request("http://example.com?q=hello%20world")  # %20
+r2 = Request("http://example.com?q=hello+world")    # +
+# 标准化后相同 → 指纹相同 → 被过滤
+```
+
+**场景 3：路径点段差异**
+```python
+r1 = Request("http://example.com/a/b/../c")
+r2 = Request("http://example.com/a/c")
+# 标准化后相同 → 指纹相同 → 被过滤
+```
+
+**场景 4：多余斜杠差异**
+```python
+r1 = Request("http://example.com//path//to//page")
+r2 = Request("http://example.com/path/to/page")
+# 标准化后相同 → 指纹相同 → 被过滤
+```
+
+#### 1.2.6 配置与自定义
+
+`canonicalize_url` 函数支持以下参数（通过 Scrapy 的指纹生成器间接控制）：
+
+| 参数 | 默认值 | 说明 |
+|-----|-------|------|
+| `keep_blank_values` | `True` | 是否保留空值查询参数 |
+| `keep_fragments` | `False` | 是否保留 URL 片段（Scrapy 默认不保留） |
+| `encoding` | `None` | URL 编码（默认 UTF-8） |
+
+在 Scrapy 中，`keep_fragments` 参数由 `fingerprint` 函数的同名参数控制：
+
+```python
+# 默认行为：忽略片段
+fingerprint(request)  # keep_fragments=False
+
+# 保留片段（用于无头浏览器等场景）
+fingerprint(request, keep_fragments=True)
+```
 
 ### 1.3 指纹计算要素
 
