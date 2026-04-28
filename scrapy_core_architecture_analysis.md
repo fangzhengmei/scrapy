@@ -1179,40 +1179,80 @@ async def _parallel_asyncio(
 
 #### 3.10.5 对背压和流控的实际影响
 
-**影响 1：背压只控制响应入队，不控制 Item Pipeline**
+**影响 1：普通响应的完整时序分析——active_size 与 Item 处理同步完成**
+
+首先需要澄清一个常见的误解：**普通响应的 `active_size` 会保持到所有产出物处理完成才归零**，而非解析完成就释放。
+
+让我们从 `enqueue_scrape` 的完整流程理解时序：
+
+```python
+# scraper.py:219-240
+@inlineCallbacks
+def enqueue_scrape(self, result: Response | Failure, request: Request, spider: Spider | None = None):
+    dfd = self.slot.add_response_request(result, request)  # 1. active_size += 1MB
+    self._scrape_next()
+    try:
+        yield dfd  # 2. 阻塞等待处理完成！
+    except Exception:
+        logger.error(...)
+    finally:
+        self.slot.finish_response(result, request)  # 3. active_size -= 1MB
+        self._check_if_closing()
+        self._scrape_next()
+```
+
+**关键时序链**：
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                    背压控制的边界                                              │
+│                    普通响应的完整处理时序（修正后）                          │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
-│  Engine.needs_backout() =                                                    │
-│      Downloader.needs_backout()  OR  Scraper.slot.needs_backout()           │
+│  enqueue_scrape()                                                           │
+│       │                                                                      │
+│       ├──▶ add_response_request() → active_size += 1MB                    │
+│       │                                                                      │
+│       ├──▶ _scrape_next() → 启动 _wait_for_processing()                 │
+│       │                                                                      │
+│       ├──▶ yield dfd  ←──────────────────────────────────────────┐          │
+│       │                                                          │          │
+│       │   _wait_for_processing()                                │          │
+│       │        │                                                 │          │
+│       │        ├──▶ await _scrape()                              │          │
+│       │        │        │                                        │          │
+│       │        │        ├──▶ await handle_spider_output_async()  │          │
+│       │        │        │        │                                 │          │
+│       │        │        │        ├──▶ await _parallel_asyncio()   │          │
+│       │        │        │        │        │                      │          │
+│       │        │        │        │        ├──▶ 并发处理所有产出物    │          │
+│       │        │        │        │        │                      │          │
+│       │        │        │        │        ├──▶ Item: await start_itemproc_async() │
+│       │        │        │        │        │   └──▶ 等待 Item Pipeline 完成 │
+│       │        │        │        │        │                      │          │
+│       │        │        │        │        └──▶ Request: engine.crawl() │
+│       │        │        │        │            └──▶ 入队调度器（不等待）     │
+│       │        │        │        │                                 │          │
+│       │        │        │        └──▶ await 所有产出物处理完成    │          │
+│       │        │        │                                              │          │
+│       │        │        └──▶ return                                   │          │
+│       │        │                                                       │          │
+│       │        └──▶ queue_dfd.callback(None) ──────────────────────┘          │
+│       │                                                                      │
+│       └──▶ finally 块执行                                                    │
+│              │                                                                      │
+│              └──▶ finish_response() → active_size -= 1MB → active_size = 0   │
 │                                                                             │
-│  Scraper.slot.needs_backout() = active_size > max_active_size              │
-│                                                                             │
-│  active_size 只追踪：                                                         │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │  已入队但尚未开始解析的 Response (queue)                              │   │
-│  │  正在解析中的 Response (active)                                       │   │
-│  │                                                                     │   │
-│  │  active_size = Σ max(len(response.body), MIN_RESPONSE_SIZE)        │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-│  active_size 不追踪：                                                         │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │  ✖ 解析后产出的 Item                                                  │   │
-│  │  ✖ 解析后产出的新 Request                                             │   │
-│  │  ✖ Item Pipeline 中正在处理的 Item                                    │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
+│  关键结论：                                                                   │
+│  active_size 会保持到以下所有 Item 都通过 Item Pipeline 处理完才归零！            │
+│  普通响应的解析与 Item 处理是同步的，不是解耦的！                                │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-**影响 2：响应解析与 Item 处理解耦**
+**正确的时序示例**：
 
 ```
-时间线示例：
+时间线示例（普通响应）：
 
 t=0:  Response A (1MB) 入队 Scraper
       active_size = 1MB
@@ -1220,76 +1260,265 @@ t=0:  Response A (1MB) 入队 Scraper
 t=1:  开始解析 Response A
       回调 parse() 产出 1000 个 Item
       
-t=2:  Response A 解析完成
-      finish_response() 执行
-      active_size -= 1MB → active_size = 0
+t=2:  解析逻辑完成，但 handle_spider_output_async 仍在执行
+      - 1000 个 Item 正在并发通过 Item Pipeline 处理
+      - 受 CONCURRENT_ITEMS=100 限制，实际是分批处理
       
-      但此时：
-      - 1000 个 Item 正在并发处理（受 CONCURRENT_ITEMS=100 限制）
-      - 部分 Item 可能仍在 Item Pipeline 中
-      - 这些都不影响 active_size
+      active_size 仍然 = 1MB（未归零！）
+      
+t=3:  最后一个 Item 完成 Item Pipeline 处理
+      handle_spider_output_async 完成
+      queue_dfd.callback(None) 被调用
+      
+      finally 块执行：
+      - finish_response()
+      - active_size -= 1MB → active_size = 0
 
-t=3:  Scraper.slot.needs_backout() = False（active_size=0）
+t=4:  Scraper.slot.needs_backout() = False（active_size=0）
       引擎可以继续从调度器取新请求
-      
-      即使：
-      - 还有 900 个 Item 在排队等待处理
-      - 这不会触发背压！
 ```
 
-**影响 3：潜在的内存风险点**
+**重要修正**：
+- 之前的分析错误地认为"解析完成后 active_size 就归零"
+- 实际上，`active_size` 会保持到 **所有 Item 都通过 Item Pipeline 处理完**才归零**
+- 普通响应的 `active_size` 与 Item 处理是 **同步**，不是解耦
 
-| 风险场景 | 说明 | 缓解措施 |
-|----------|------|----------|
-| **大响应 + 慢解析** | 响应体一直在内存中直到解析完成 | 背压会阻止更多响应入队 |
-| **快速产出 + 慢 Pipeline** | 解析快但 Item Pipeline 处理慢，Item 在内存累积 | `CONCURRENT_ITEMS` 限制并发处理数 |
-| **递归产出** | 单个回调持续产出大量 Item | 队列缓冲有限（`concurrent_items * 2`） |
-| **嵌套解析** | 解析过程中又触发更多解析 | 背压基于体积，可能未充分反映 |
+---
 
-**影响 4：两个并发参数的不同作用**
+#### 3.10.6 真正的解耦场景：起始阶段直接产出数据项
+
+**"积压量为零但数据项仍在流水线"真正会发生的场景是：起始阶段直接产出数据项的路径。**
+
+让我们分析这条特殊路径的实现：
+
+```python
+# engine.py:287-296
+if isinstance(item_or_request, Request):
+    # 正常路径：请求入队调度器
+    self.crawl(item_or_request)
+else:
+    # 特殊路径：直接发送到 Item Pipeline
+    assert self._slot is not None
+    _schedule_coro(
+        self.scraper.start_itemproc_async(item_or_request, response=None)
+    )
+    self._slot.nextcall.schedule()
+```
+
+**关键机制：`_schedule_coro` 创建独立后台任务**
+
+```python
+# defer.py:527-539
+def _schedule_coro(coro: Coroutine[Any, Any, Any]) -> None:
+    """Schedule the coroutine as a task or a Deferred.
+    
+    This doesn't store the reference to the task/Deferred...
+    """
+    if not is_asyncio_available():
+        Deferred.fromCoroutine(coro)  # Twisted 模式
+        return
+    loop = asyncio.get_event_loop()
+    loop.create_task(coro)  # Asyncio 模式：创建后台任务，不等待！
+```
+
+**两条路径的对比**：
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                    两个关键并发参数的对比                                      │
+│                    两条数据项产出路径的对比                                   │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
-│  CONCURRENT_REQUESTS (默认 16)                                               │
+│  路径 A：普通响应产出的 Item（来自 Response 解析）                           │
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │  作用层面：Downloader                                                  │   │
-│  │  控制对象：同时进行的 HTTP 请求数量                                    │   │
-│  │  触发背压：downloader.needs_backout()                                  │   │
-│  │  影响：阻止引擎从调度器取新请求                                         │   │
+│  │                                                                     │   │
+│  │  触发方式：enqueue_scrape() 同步调用                                │   │
+│  │                                                                     │   │
+│  │  时序：                                                              │   │
+│  │  enqueue_scrape()                                                   │   │
+│  │       │                                                              │   │
+│  │       ├──▶ add_response_request() → active_size += 1MB              │   │
+│  │       │                                                              │   │
+│  │       ├──▶ yield dfd （等待！）                                      │   │
+│  │       │       │                                                      │   │
+│  │       │       └──▶ _scrape() → handle_spider_output_async()      │   │
+│  │       │               │                                              │   │
+│  │       │               └──▶ start_itemproc_async(Item)                 │   │
+│  │       │                       │                              │   │
+│  │       │                       ├──▶ itemproc_size += 1                        │   │
+│  │       │                       │                              │   │
+│  │       │                       └──▶ 等待 Item Pipeline 完成          │   │
+│  │       │                               │                              │   │
+│  │       │                               └──▶ itemproc_size -= 1        │   │
+│  │       │                                                              │   │
+│  │       └──▶ finally: finish_response() → active_size -= 1MB            │   │
+│  │                                                                     │   │
+│  │  追踪关系：                                                           │   │
+│  │  ✓ active_size 追踪 Response 体积（保持到 Item 处理完）                  │   │
+│  │  ✓ itemproc_size 追踪 Item 数量                                     │   │
+│  │  ✓ 两者大致同步（active_size 归零意味着 itemproc_size 也已归零）         │   │
+│  │                                                                     │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
 │                                                                             │
-│  CONCURRENT_ITEMS (默认 100)                                                 │
+│  路径 B：起始阶段直接产出的 Item（来自 Spider.start()）                      │
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │  作用层面：Scraper 回调产出物处理                                       │   │
-│  │  控制对象：同时处理的 Item/Request 数量                                 │   │
-│  │  触发背压：不直接触发，通过队列间接限流                                  │   │
-│  │  影响：同一响应的多个产出物的并发度                                      │   │
+│  │                                                                     │   │
+│  │  触发方式：_schedule_coro() 创建独立后台任务                         │   │
+│  │                                                                     │   │
+│  │  时序：                                                              │   │
+│  │  _process_start_next()                                              │   │
+│  │       │                                                              │   │
+│  │       ├──▶ item_or_request = await self._start.__anext__()           │   │
+│  │       │                                                              │   │
+│  │       └──▶ 如果是 Item：                                             │   │
+│  │            │                                                              │   │
+│  │            ├──▶ _schedule_coro(                                         │   │
+│  │            │       │                                                  │   │
+│  │            │       └──▶ loop.create_task() 或 Deferred.fromCoroutine() │   │
+│  │            │              │                                           │   │
+│  │            │              └──▶ 后台任务开始执行：                        │   │
+│  │            │                      │                                   │   │
+│  │            │                      ├──▶ start_itemproc_async(Item)           │   │
+│  │            │                      │       │                           │   │
+│  │            │                      │       ├──▶ itemproc_size += 1        │   │
+│  │            │                      │       │                           │   │
+│  │            │                      │       └──▶ 等待 Item Pipeline 完成  │   │
+│  │            │                      │               │                   │   │
+│  │            │                      │               └──▶ itemproc_size -= 1│
+│  │            │                      │                                   │   │
+│  │            │                      └──▶ 后台任务独立运行，不被等待           │   │
+│  │            │                                                          │   │
+│  │            └──▶ _process_start_next() 继续执行，不等待后台任务！          │   │
+│  │                                                                     │   │
+│  │  追踪关系：                                                           │   │
+│  │  ✖ active_size 不追踪（没有 Response，active_size = 0）               │   │
+│  │  ✓ itemproc_size 追踪 Item 数量                                     │   │
+│  │  ✖ 两者完全独立！                                                    │   │
+│  │                                                                     │   │
+│  │  这才是真正的解耦场景！                                               │   │
+│  │                                                                     │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
-│  关键区别：                                                                   │
-│  - CONCURRENT_REQUESTS 直接参与背压判断（needs_backout）                    │
-│  - CONCURRENT_ITEMS 不直接参与背压判断，但影响内存占用                       │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-#### 3.10.6 设计权衡总结
+**真正的解耦场景时序示例**：
+
+```
+时间线示例（起始阶段直接产出 Item）：
+
+t=0:  Spider.start() 产出 Item A
+      
+      _process_start_next() 执行：
+      - item_or_request = Item A
+      - 不是 Request，走特殊路径
+      - _schedule_coro(start_itemproc_async(Item A, response=None))
+      
+      后台任务创建，不等待！
+      
+      active_size = 0（始终为 0，因为没有 Response）
+      itemproc_size += 1
+
+t=1:  _process_start_next() 继续执行，可能产出更多 Item
+      或继续处理下一个 start_request
+      
+      后台任务正在处理 Item A：
+      - Item A 进入 Item Pipeline
+      - 可能需要数据库写入等耗时操作
+      
+      active_size = 0（仍然为 0）
+      itemproc_size = 1
+
+t=2:  Scraper.slot.needs_backout() = False（active_size=0）
+      引擎可以继续从调度器取新请求
+      
+      但此时：
+      - Item A 仍在 Item Pipeline 中处理
+      - itemproc_size = 1 > 0
+      - 这才是真正的"积压量为零但数据项仍在流水线"！
+
+t=3:  后台任务完成
+      itemproc_size -= 1 → itemproc_size = 0
+      
+      active_size 始终 = 0
+```
+
+---
+
+#### 3.10.7 两个追踪指标的范围差异
+
+| 指标 | 类型 | 追踪范围 | 触发时机 | 解耦场景 |
+|------|------|----------|----------|----------|
+| `active_size` | **体积指标 | 已入队/正在处理的 Response 体积 | `add_response_request` 增加，`finish_response` 减少 | 普通响应：与 Item 处理同步 |
+| `itemproc_size` | **数量指标** | 正在 Item Pipeline 中处理的 Item 数量 | `start_itemproc_async` 增加，finally 减少 | 起始路径：与 active_size 不追踪 |
+
+**关键差异分析**：
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    两个指标的追踪范围对比                                         │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  active_size（体积积压量）：                                                │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  设计目的：防止 Response 体积累导致 OOM                                │   │
+│  │                                                                     │   │
+│  │  追踪对象：                                                           │   │
+│  │  ✓ Response（已入队但尚未开始解析的 Response                           │   │
+│  │  ✓ Response（正在解析中的 Response）                                  │   │
+│  │  ✓ Response（正在等待 Item 处理完成的 Response）                        │   │
+│  │                                                                     │   │
+│  │  不追踪：                                                           │   │
+│  │  ✖ 普通响应产出的 Item（但 active_size 会保持到 Item 处理完）            │   │
+│  │  ✖ 起始阶段直接产出的 Item（完全不涉及 Response）                    │   │
+│  │  ✖ 新 Request（入队调度器后就释放）                                   │   │
+│  │                                                                     │   │
+│  │  背压触发：active_size > max_active_size（默认 5MB）                   │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  itemproc_size（流水线计数）：                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  设计目的：监控 Item Pipeline 的实际负载                                │   │
+│  │                                                                     │   │
+│  │  追踪对象：                                                           │   │
+│  │  ✓ 普通响应产出的 Item（正在 Item Pipeline 处理）                         │   │
+│  │  ✓ 起始阶段直接产出的 Item（正在 Item Pipeline 处理）                  │   │
+│  │                                                                     │   │
+│  │  不追踪：                                                           │   │
+│  │  ✖ Response（active_size 单独追踪）                                   │   │
+│  │  ✖ 新 Request（入队调度器，不走 Item Pipeline）                   │   │
+│  │                                                                     │   │
+│  │  背压触发：不直接触发背压，但用于监控统计（get_engine_status）            │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**两者的同步与解耦场景：
+
+| 场景 | active_size | itemproc_size | 关系 |
+|------|-------------|---------------|------|
+| **普通响应处理中 | > 0 | > 0 | **同步** |
+| **普通响应处理完成 | = 0 | = 0 | **同步** |
+| **起始路径 Item 处理中 | = 0 | > 0 | **解耦**（真正的独立场景） |
+| **起始路径 Item 处理完成** | = 0 | = 0 | 同步 |
+
+---
+
+#### 3.10.8 设计权衡总结（修正后）
 
 | 设计决策 | 优势 | 劣势 |
 |----------|------|------|
-| **背压基于响应体积** | 准确反映内存压力，大响应及时限流 | 不追踪 Item 内存占用 |
-| **产出物并发处理** | 提高 Pipeline 吞吐量，充分利用 I/O | 内存占用难以精确预测 |
-| **响应解析与 Item 处理解耦** | 解析完成即可释放大响应体 | Item 处理慢时可能内存累积 |
-| **独立的 CONCURRENT_ITEMS** | 灵活控制不同阶段的并发 | 两个参数需要配合调优 |
+| **背压基于响应体积** | 准确反映 Response 内存压力，大响应及时限流 | 不追踪起始路径的独立 Item |
+| **普通响应同步等待 Item 处理** | 确保 Response 体积极限与 Item 处理大致同步 | 大响应 + 慢 Pipeline 会阻塞新请求 |
+| **起始路径独立后台任务** | 灵活支持非 HTTP 数据源，不阻塞启动流程 | `active_size` 不追踪，可能内存风险 |
+| **独立的双指标追踪** | `active_size` 限流，`itemproc_size` 监控 | 用户需要理解两者差异 |
 
 **调优建议**：
-- 如果响应普遍较大，降低 `SCRAPER_SLOT_MAX_ACTIVE_SIZE`
-- 如果 Item Pipeline 较慢（如数据库写入），降低 `CONCURRENT_ITEMS`
-- 如果爬虫主要产出大量小 Item，可适当提高 `CONCURRENT_ITEMS`
-- 监控 `itemproc_size` 统计，了解 Pipeline 实际负载
+- 如果响应普遍较大，降低 `SCRAPER_SLOT_MAX_ACTIVE_SIZE`（默认 5MB）
+- 如果 Item Pipeline 较慢（如数据库写入），降低 `CONCURRENT_ITEMS`（默认 100）
+- 如果爬虫主要从起始阶段产出大量 Item，需要额外监控 `itemproc_size` 而非仅依赖 `active_size`
+- 监控 `itemproc_size` 统计（通过 `get_engine_status`），了解 Pipeline 实际负载
+- 注意：起始路径的 Item 处理不会触发背压，需要自行控制
 
 ---
 
