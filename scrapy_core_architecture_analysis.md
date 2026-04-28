@@ -825,6 +825,472 @@ def pop(self) -> Request | None:
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
+### 3.9 起始阶段直接产出数据项的路径分析
+
+**爬虫起始阶段不只能产出请求，还可以直接产出数据项——这条路径完全绕过下载和解析环节。**
+
+#### 3.9.1 特殊路径的代码实现
+
+从引擎的 `_process_start_next` 方法可以看到这条特殊路径：
+
+```python
+# engine.py:268-296
+async def _process_start_next(self) -> None:
+    """Processes the next item or request from Spider.start().
+    
+    If a request, it is scheduled. If an item, it is sent to item
+    pipelines.
+    """
+    assert self._start is not None
+    try:
+        item_or_request = await self._start.__anext__()
+    except StopAsyncIteration:
+        self._start = None
+    except Exception as exception:
+        # ... 异常处理
+    else:
+        if not self.spider:
+            return  # spider already closed
+        if isinstance(item_or_request, Request):
+            # 正常路径：请求入队调度器
+            self.crawl(item_or_request)
+        else:
+            # 特殊路径：直接发送到 Item Pipeline
+            assert self._slot is not None
+            _schedule_coro(
+                self.scraper.start_itemproc_async(item_or_request, response=None)
+            )
+            self._slot.nextcall.schedule()
+```
+
+#### 3.9.2 两条路径的对比
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    Spider.start() 产出物的两条处理路径                         │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  路径 A：Request（常规爬取路径）                                               │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                                                                     │   │
+│  │  Spider.start() ──▶ Request ──▶ Scheduler.enqueue_request()      │   │
+│  │                                                    │                │   │
+│  │                                                    ▼                │   │
+│  │                                              Downloader            │   │
+│  │                                                    │                │   │
+│  │                                                    ▼                │   │
+│  │                                              Scraper (解析)        │   │
+│  │                                                    │                │   │
+│  │                                      ┌─────────────┴─────────────┐ │   │
+│  │                                      ▼                           ▼ │   │
+│  │                                New Request                   Item  │   │
+│  │                                      │                           │  │   │
+│  │                                      ▼                           ▼  │   │
+│  │                               Scheduler              Item Pipeline │   │
+│  │                                                                     │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  路径 B：Item（特殊直连路径）                                                 │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                                                                     │   │
+│  │  Spider.start() ──▶ Item ──▶ scaper.start_itemproc_async()       │   │
+│  │                                                    │                │   │
+│  │                                                    ▼                │   │
+│  │                                            Item Pipeline            │   │
+│  │                                                                     │   │
+│  │  完全绕过：Scheduler、Downloader、Scraper 解析环节                   │   │
+│  │                                                                     │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 3.9.3 设计意图分析
+
+| 场景 | 说明 | 示例 |
+|------|------|------|
+| **种子数据注入** | 起始数据不需要爬取，直接是结构化数据 | 从配置文件读取的初始产品列表 |
+| **非 HTTP 数据源** | 数据来自文件、数据库或其他协议 | 从 CSV 文件读取的用户信息 |
+| **API 混合爬取** | 部分数据通过非 HTTP API 获取 | 使用 SDK 获取云服务数据 |
+| **测试与调试** | 测试 Item Pipeline 而无需实际爬取 | 硬编码的测试数据 |
+| **增量爬取** | 上次爬取的状态作为初始数据 | 从 JOBDIR 恢复的待处理 Item |
+
+#### 3.9.4 特殊路径的信号和日志处理
+
+`start_itemproc_async` 方法专门处理这种无响应源的 Item：
+
+```python
+# scraper.py:487-549
+async def start_itemproc_async(
+    self, item: Any, *, response: Response | Failure | None
+) -> None:
+    """Send *item* to the item pipelines for processing.
+    
+    *response* is the source of the item data. If the item does not come
+    from response data, e.g. it was hard-coded, set it to ``None``.
+    """
+    assert self.slot is not None
+    assert self.crawler.spider is not None
+    self.slot.itemproc_size += 1
+    try:
+        # 直接进入 Item Pipeline
+        if self._itemproc_has_async["process_item"]:
+            output = await self.itemproc.process_item_async(item)
+        else:
+            output = await maybe_deferred_to_future(
+                self.itemproc.process_item(item, self.crawler.spider)
+            )
+    except DropItem as ex:
+        logkws = self.logformatter.dropped(item, ex, response, self.crawler.spider)
+        # ... 处理丢弃
+    else:
+        logkws = self.logformatter.scraped(output, response, self.crawler.spider)
+        await self.signals.send_catch_log_async(
+            signal=signals.item_scraped,
+            item=output,
+            response=response,  # 可能为 None
+            spider=self.crawler.spider,
+        )
+    finally:
+        self.slot.itemproc_size -= 1
+```
+
+**关键设计点**：
+- `response=None` 明确标记 Item 无 HTTP 响应来源
+- 信号系统仍正常工作（`item_scraped`），便于扩展监控
+- `itemproc_size` 仍计入统计，反映 Pipeline 实际负载
+
+---
+
+### 3.10 解析器背压机制深度分析
+
+**解析器的背压限制本质上是对已入队响应的内容体积积压量的控制，而非请求数量；且回调产出物是被并发处理的而非逐一顺序处理。**
+
+#### 3.10.1 背压触发条件：体积 vs 数量
+
+`Scraper.Slot` 的背压实现：
+
+```python
+# scraper.py:59-101
+class Slot:
+    """Scraper slot (one per running spider)"""
+    
+    MIN_RESPONSE_SIZE = 1024  # 最小计数体积
+    
+    def __init__(self, max_active_size: int = 5000000):  # 默认 5MB
+        self.max_active_size: int = max_active_size
+        self.queue: deque[QueueTuple] = deque()
+        self.active: set[Request] = set()
+        self.active_size: int = 0  # 关键：体积而非数量
+        
+    def add_response_request(
+        self, result: Response | Failure, request: Request
+    ) -> Deferred[None]:
+        # 响应入队时累积体积
+        deferred: Deferred[None] = Deferred()
+        self.queue.append((result, request, deferred))
+        if isinstance(result, Response):
+            # 按响应体大小计数，不小于 MIN_RESPONSE_SIZE
+            self.active_size += max(len(result.body), self.MIN_RESPONSE_SIZE)
+        else:
+            # 错误响应按最小体积计数
+            self.active_size += self.MIN_RESPONSE_SIZE
+        return deferred
+    
+    def finish_response(self, result: Response | Failure, request: Request) -> None:
+        # 响应处理完成后释放体积
+        self.active.remove(request)
+        if isinstance(result, Response):
+            self.active_size -= max(len(result.body), self.MIN_RESPONSE_SIZE)
+        else:
+            self.active_size -= self.MIN_RESPONSE_SIZE
+    
+    def needs_backout(self) -> bool:
+        # 背压触发：体积超过阈值
+        return self.active_size > self.max_active_size
+```
+
+#### 3.10.2 为什么是体积而非数量？
+
+**数量控制的缺陷**：
+
+```
+场景：10 个响应等待处理
+
+数量控制（假设限制 10 个）：
+┌──────────────────────────────────────────────────────────────┐
+│  响应1: 100KB HTML 页面                                       │
+│  响应2: 100KB HTML 页面                                       │
+│  ...                                                          │
+│  响应10: 100KB HTML 页面                                      │
+│                                                              │
+│  总内存: ~1MB，一切正常                                        │
+└──────────────────────────────────────────────────────────────┘
+
+但如果是：
+┌──────────────────────────────────────────────────────────────┐
+│  响应1: 10MB JSON API 响应                                    │
+│  响应2: 10MB JSON API 响应                                    │
+│  ...                                                          │
+│  响应10: 10MB JSON API 响应                                   │
+│                                                              │
+│  总内存: ~100MB，可能 OOM！                                    │
+│  但数量控制（10 个限制）不会触发背压                           │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**体积控制的优势**：
+
+| 维度 | 数量控制 | 体积控制（Scrapy 默认） |
+|------|----------|-------------------------|
+| **内存预测** | 差（响应大小差异大） | 好（直接映射内存占用） |
+| **小响应场景** | 可能过度保守 | 允许更多并行 |
+| **大响应场景** | 可能内存溢出 | 及时触发背压 |
+| **错误响应** | 与正常响应无区别 | 统一按 1KB 计数 |
+| **配置阈值** | 抽象（多少个算多？） | 具体（5MB 有明确含义） |
+
+#### 3.10.3 回调产出物的并发处理机制
+
+`handle_spider_output_async` 方法实现了产出物的并发处理：
+
+```python
+# scraper.py:406-445
+async def handle_spider_output_async(
+    self,
+    result: Iterable[_T] | AsyncIterator[_T],
+    request: Request,
+    response: Response | Failure,
+) -> None:
+    """Pass items/requests produced by a callback to ``_process_spidermw_output()`` in parallel."""
+    it: Iterable[_T] | AsyncIterator[_T]
+    
+    if is_asyncio_available():
+        # Asyncio 模式
+        if isinstance(result, AsyncIterator):
+            it = aiter_errback(result, self.handle_spider_error, request, response)
+        else:
+            it = iter_errback(result, self.handle_spider_error, request, response)
+        await _parallel_asyncio(
+            it, self.concurrent_items, self._process_spidermw_output_async, response
+        )
+        return
+    
+    # Twisted 模式
+    if isinstance(result, AsyncIterator):
+        it = aiter_errback(result, self.handle_spider_error, request, response)
+        await maybe_deferred_to_future(
+            parallel_async(
+                it,
+                self.concurrent_items,
+                self._process_spidermw_output,
+                response,
+            )
+        )
+        return
+    
+    it = iter_errback(result, self.handle_spider_error, request, response)
+    await maybe_deferred_to_future(
+        parallel(
+            it,
+            self.concurrent_items,
+            self._process_spidermw_output,
+            response,
+        )
+    )
+```
+
+**核心配置**：`concurrent_items` 来自 `CONCURRENT_ITEMS`（默认 100）。
+
+#### 3.10.4 并发处理的工作原理
+
+`_parallel_asyncio` 的实现：
+
+```python
+# asyncio.py:95-130
+async def _parallel_asyncio(
+    iterable: Iterable[_T] | AsyncIterator[_T],
+    count: int,  # concurrent_items
+    callable_: Callable[...],
+    *args, **kwargs,
+) -> None:
+    """Execute a callable over the objects in the given iterable, in parallel,
+    using no more than ``count`` concurrent calls."""
+    
+    # 生产者-消费者模型
+    queue: asyncio.Queue[_T | None] = asyncio.Queue(count * 2)  # 缓冲队列
+    
+    async def worker() -> None:
+        while True:
+            item = await queue.get()
+            if item is None:
+                break
+            try:
+                await callable_(item, *args, **kwargs)
+            finally:
+                queue.task_done()
+    
+    async def fill_queue() -> None:
+        async for item in as_async_generator(iterable):
+            await queue.put(item)
+        for _ in range(count):
+            await queue.put(None)  # 发送结束信号
+    
+    fill_task = asyncio.create_task(fill_queue())
+    work_tasks = [asyncio.create_task(worker()) for _ in range(count)]
+    await asyncio.wait([fill_task, *work_tasks])
+```
+
+**数据流图**：
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    回调产出物的并发处理流程                                     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  Spider 回调（parse()）                                                       │
+│       │                                                                      │
+│       ▼                                                                      │
+│  [Item1, Item2, Item3, ..., ItemN]  ──▶ 产出物迭代器                        │
+│       │                                                                      │
+│       │  fill_queue()                                                        │
+│       ▼                                                                      │
+│  ┌─────────────────────────────────────┐                                    │
+│  │  Queue (size = concurrent_items * 2) │                                    │
+│  │  [Item1, Item2, Item3, ...]         │                                    │
+│  └─────────────────────────────────────┘                                    │
+│       │                                                                      │
+│       │  多个 worker 并发消费                                                 │
+│       ▼                                                                      │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐                                  │
+│  │ Worker 1 │  │ Worker 2 │  │ Worker 3 │  ... (共 concurrent_items 个)   │
+│  │ 处理 Item│  │ 处理 Item│  │ 处理 Item│                                  │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘                                  │
+│       │              │              │                                         │
+│       ▼              ▼              ▼                                         │
+│  _process_spidermw_output()  ──▶  Spider 中间件 → Item Pipeline 或 Scheduler │
+│                                                                             │
+│  关键点：                                                                     │
+│  1. 同一响应的多个产出物并发处理（不是顺序）                                   │
+│  2. 最大并发数由 CONCURRENT_ITEMS 控制（默认 100）                          │
+│  3. 队列缓冲 = concurrent_items * 2                                           │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 3.10.5 对背压和流控的实际影响
+
+**影响 1：背压只控制响应入队，不控制 Item Pipeline**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    背压控制的边界                                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  Engine.needs_backout() =                                                    │
+│      Downloader.needs_backout()  OR  Scraper.slot.needs_backout()           │
+│                                                                             │
+│  Scraper.slot.needs_backout() = active_size > max_active_size              │
+│                                                                             │
+│  active_size 只追踪：                                                         │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  已入队但尚未开始解析的 Response (queue)                              │   │
+│  │  正在解析中的 Response (active)                                       │   │
+│  │                                                                     │   │
+│  │  active_size = Σ max(len(response.body), MIN_RESPONSE_SIZE)        │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  active_size 不追踪：                                                         │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  ✖ 解析后产出的 Item                                                  │   │
+│  │  ✖ 解析后产出的新 Request                                             │   │
+│  │  ✖ Item Pipeline 中正在处理的 Item                                    │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**影响 2：响应解析与 Item 处理解耦**
+
+```
+时间线示例：
+
+t=0:  Response A (1MB) 入队 Scraper
+      active_size = 1MB
+
+t=1:  开始解析 Response A
+      回调 parse() 产出 1000 个 Item
+      
+t=2:  Response A 解析完成
+      finish_response() 执行
+      active_size -= 1MB → active_size = 0
+      
+      但此时：
+      - 1000 个 Item 正在并发处理（受 CONCURRENT_ITEMS=100 限制）
+      - 部分 Item 可能仍在 Item Pipeline 中
+      - 这些都不影响 active_size
+
+t=3:  Scraper.slot.needs_backout() = False（active_size=0）
+      引擎可以继续从调度器取新请求
+      
+      即使：
+      - 还有 900 个 Item 在排队等待处理
+      - 这不会触发背压！
+```
+
+**影响 3：潜在的内存风险点**
+
+| 风险场景 | 说明 | 缓解措施 |
+|----------|------|----------|
+| **大响应 + 慢解析** | 响应体一直在内存中直到解析完成 | 背压会阻止更多响应入队 |
+| **快速产出 + 慢 Pipeline** | 解析快但 Item Pipeline 处理慢，Item 在内存累积 | `CONCURRENT_ITEMS` 限制并发处理数 |
+| **递归产出** | 单个回调持续产出大量 Item | 队列缓冲有限（`concurrent_items * 2`） |
+| **嵌套解析** | 解析过程中又触发更多解析 | 背压基于体积，可能未充分反映 |
+
+**影响 4：两个并发参数的不同作用**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    两个关键并发参数的对比                                      │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  CONCURRENT_REQUESTS (默认 16)                                               │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  作用层面：Downloader                                                  │   │
+│  │  控制对象：同时进行的 HTTP 请求数量                                    │   │
+│  │  触发背压：downloader.needs_backout()                                  │   │
+│  │  影响：阻止引擎从调度器取新请求                                         │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  CONCURRENT_ITEMS (默认 100)                                                 │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  作用层面：Scraper 回调产出物处理                                       │   │
+│  │  控制对象：同时处理的 Item/Request 数量                                 │   │
+│  │  触发背压：不直接触发，通过队列间接限流                                  │   │
+│  │  影响：同一响应的多个产出物的并发度                                      │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  关键区别：                                                                   │
+│  - CONCURRENT_REQUESTS 直接参与背压判断（needs_backout）                    │
+│  - CONCURRENT_ITEMS 不直接参与背压判断，但影响内存占用                       │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 3.10.6 设计权衡总结
+
+| 设计决策 | 优势 | 劣势 |
+|----------|------|------|
+| **背压基于响应体积** | 准确反映内存压力，大响应及时限流 | 不追踪 Item 内存占用 |
+| **产出物并发处理** | 提高 Pipeline 吞吐量，充分利用 I/O | 内存占用难以精确预测 |
+| **响应解析与 Item 处理解耦** | 解析完成即可释放大响应体 | Item 处理慢时可能内存累积 |
+| **独立的 CONCURRENT_ITEMS** | 灵活控制不同阶段的并发 | 两个参数需要配合调优 |
+
+**调优建议**：
+- 如果响应普遍较大，降低 `SCRAPER_SLOT_MAX_ACTIVE_SIZE`
+- 如果 Item Pipeline 较慢（如数据库写入），降低 `CONCURRENT_ITEMS`
+- 如果爬虫主要产出大量小 Item，可适当提高 `CONCURRENT_ITEMS`
+- 监控 `itemproc_size` 统计，了解 Pipeline 实际负载
+
 ---
 
 ## 4. Crawler 对象整合机制
