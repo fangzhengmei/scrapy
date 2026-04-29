@@ -49,7 +49,192 @@ def _add_middleware(self, pipe: Any) -> None:
         self.methods["process_item"].append(pipe.process_item)
 ```
 
-### 1.2 异步责任链串联机制
+### 1.2 责任链执行路径的运行时选择
+
+Scrapy 在初始化时会根据各 Pipeline 组件的异步支持情况，决定实际使用的执行路径。这一判定逻辑位于 `Scraper.__init__` 中的 `_check_deprecated_itemproc_method` 方法。
+
+**核心判定逻辑：**
+
+```python
+# scrapy/core/scraper.py:103-152
+class Scraper:
+    def __init__(self, crawler: Crawler) -> None:
+        # ...
+        self._itemproc_has_async: dict[str, bool] = {}
+        for method in [
+            "open_spider",
+            "close_spider",
+            "process_item",
+        ]:
+            self._check_deprecated_itemproc_method(method)
+        # ...
+
+    def _check_deprecated_itemproc_method(self, method: str) -> None:
+        itemproc_cls = type(self.itemproc)
+        
+        # ========== 分支 1：组件未提供异步方法 ==========
+        if not hasattr(self.itemproc, "process_item_async"):
+            warnings.warn(
+                f"{global_object_name(itemproc_cls)} doesn't define a {method}_async() method,"
+                f" this is deprecated and the method will be required in future Scrapy versions.",
+                ScrapyDeprecationWarning,
+                stacklevel=2,
+            )
+            self._itemproc_has_async[method] = False
+        
+        # ========== 分支 2：提供了异步方法但仅覆盖了同步版 ==========
+        elif (
+            issubclass(itemproc_cls, ItemPipelineManager)
+            and method_is_overridden(itemproc_cls, ItemPipelineManager, method)
+            and not method_is_overridden(
+                itemproc_cls, ItemPipelineManager, f"{method}_async"
+            )
+        ):
+            warnings.warn(
+                f"{global_object_name(itemproc_cls)} overrides {method}() but doesn't override {method}_async()."
+                f" This is deprecated. {method}() will be used, but in future Scrapy versions {method}_async() will be used instead.",
+                ScrapyDeprecationWarning,
+                stacklevel=2,
+            )
+            self._itemproc_has_async[method] = False
+        
+        # ========== 分支 3：正常支持异步 ==========
+        else:
+            self._itemproc_has_async[method] = True
+```
+
+**方法覆盖检测机制 `method_is_overridden`：**
+
+```python
+# scrapy/utils/deprecate.py:169-200
+def method_is_overridden(subclass: type, base_class: type, method_name: str) -> bool:
+    """
+    Return True if a method named ``method_name`` of a ``base_class``
+    is overridden in a ``subclass``.
+    """
+    base_method = getattr(base_class, method_name)
+    sub_method = getattr(subclass, method_name)
+    # 通过比较方法的代码对象来判断是否被覆盖
+    return base_method.__code__ is not sub_method.__code__
+```
+
+**三条判定分支的详细说明：**
+
+| 分支 | 判定条件 | `_itemproc_has_async` 值 | 执行路径 | 废弃警告 |
+|-----|---------|------------------------|---------|---------|
+| **分支 1** | 组件完全没有 `process_item_async` 方法 | `False` | 使用旧版同步方法 | 有警告（严重） |
+| **分支 2** | 有 `_async` 方法但只覆盖了同步版，未覆盖异步版 | `False` | 使用旧版同步方法 | 有警告（中等） |
+| **分支 3** | 正常覆盖了 `_async` 方法，或使用基类实现 | `True` | 使用新版异步方法 | 无警告 |
+
+**运行时执行路径选择：**
+
+```python
+# scrapy/core/scraper.py:487-506
+async def start_itemproc_async(
+    self, item: Any, *, response: Response | Failure | None
+) -> None:
+    # ...
+    try:
+        # 根据 _itemproc_has_async 选择执行路径
+        if self._itemproc_has_async["process_item"]:
+            # 路径 A：使用新版异步方法
+            output = await self.itemproc.process_item_async(item)
+        else:
+            # 路径 B：使用旧版同步方法（需包装 Deferred）
+            output = await maybe_deferred_to_future(
+                self.itemproc.process_item(item, self.crawler.spider)
+            )
+    # ...
+```
+
+### 1.3 旧式组件的爬虫实例参数透传机制
+
+对于需要接收 `spider` 参数的旧式 Pipeline 组件，Scrapy 通过 `_mw_methods_requiring_spider` 集合进行判定和透传。
+
+**参数透传判定机制：**
+
+```python
+# scrapy/middleware.py:122-132
+def _check_mw_method_spider_arg(self, method: Callable) -> None:
+    # 检查方法是否需要 spider 参数（没有默认值）
+    if argument_is_required(method, "spider"):
+        warnings.warn(
+            f"{method.__qualname__}() requires a spider argument,"
+            f" this is deprecated and the argument will not be passed in future Scrapy versions."
+            f" If you need to access the spider instance you can save the crawler instance"
+            f" passed to from_crawler() and use its spider attribute.",
+            category=ScrapyDeprecationWarning,
+            stacklevel=2,
+        )
+        # 标记该方法需要 spider 参数
+        self._mw_methods_requiring_spider.add(method)
+```
+
+**参数检测函数 `argument_is_required`：**
+
+```python
+# scrapy/utils/deprecate.py:203-222
+def argument_is_required(func: Callable[..., Any], arg_name: str) -> bool:
+    """
+    Check if a function argument is required (exists and doesn't have a default value).
+    
+    >>> def func(a, b=1, c=None):
+    ...     pass
+    >>> argument_is_required(func, 'a')
+    True
+    >>> argument_is_required(func, 'b')
+    False
+    >>> argument_is_required(func, 'c')
+    False
+    """
+    args = get_func_args_dict(func)
+    param = args.get(arg_name)
+    return param is not None and param.default is inspect.Parameter.empty
+```
+
+**运行时参数透传逻辑：**
+
+```python
+# scrapy/middleware.py:134-156
+async def _process_chain(
+    self,
+    methodname: str,
+    obj: _T,
+    *args: Any,
+    add_spider: bool = False,
+    always_add_spider: bool = False,
+    warn_deferred: bool = False,
+) -> _T:
+    methods = cast(
+        "Iterable[Callable[Concatenate[_T, _P], _T]]", self.methods[methodname]
+    )
+    for method in methods:
+        warn = global_object_name(method) if warn_deferred else None
+        
+        # ========== 参数透传判定 ==========
+        if always_add_spider or (
+            add_spider and method in self._mw_methods_requiring_spider
+        ):
+            # 路径 A：需要 spider 参数，透传 self._spider
+            obj = await ensure_awaitable(
+                method(obj, *(*args, self._spider)), _warn=warn
+            )
+        else:
+            # 路径 B：不需要 spider 参数，直接调用
+            obj = await ensure_awaitable(method(obj, *args), _warn=warn)
+    return obj
+```
+
+**参数透传决策表：**
+
+| 方法签名 | `argument_is_required` 返回 | `_mw_methods_requiring_spider` | 实际调用方式 |
+|---------|---------------------------|-------------------------------|-------------|
+| `def process_item(self, item, spider):` | `True` | ✅ 加入集合 | `method(item, spider)` |
+| `def process_item(self, item, spider=None):` | `False` | ❌ 不加入 | `method(item)` |
+| `def process_item(self, item):` | `False` | ❌ 不加入 | `method(item)` |
+| `async def process_item_async(self, item):` | `False` | ❌ 不加入 | `method(item)` |
+
+### 1.4 异步责任链串联机制
 
 **核心责任链执行方法 `_process_chain`：**
 
@@ -98,7 +283,7 @@ async def process_item_async(self, item: Any) -> Any:
     )
 ```
 
-### 1.3 数据流转路径
+### 1.5 数据流转路径
 
 **完整数据流转图：**
 
@@ -113,19 +298,20 @@ Scraper._process_spidermw_output_async()
     ↓
 Scraper.start_itemproc_async()
     ↓
-ItemPipelineManager.process_item_async()
+[_itemproc_has_async 判定]
     ↓
-MiddlewareManager._process_chain()
-    ↓
-Pipeline 1.process_item() → 返回值
-    ↓
-Pipeline 2.process_item(返回值) → 新返回值
-    ↓
-...
-    ↓
-最终处理后的 Item
-    ↓
-信号：item_scraped
+    ├─ True  → ItemPipelineManager.process_item_async()
+    │               ↓
+    │         MiddlewareManager._process_chain()
+    │               ↓
+    │         [_mw_methods_requiring_spider 判定]
+    │               ↓
+    │               ├─ True  → method(item, spider)
+    │               └─ False → method(item)
+    │
+    └─ False → ItemPipelineManager.process_item(item, spider)
+                    ↓
+              (旧式同步路径)
 ```
 
 **Scraper 中的触发入口：**
@@ -349,21 +535,126 @@ class DropItem(Exception):
 
     def __init__(self, message: str, log_level: str | None = None):
         super().__init__(message)
-        self.log_level = log_level
+        self.log_level = log_level  # 携带自定义日志级别
 ```
 
-### 3.3 异常处理路径对比
+### 3.3 丢弃异常的日志级别完整决策链
+
+**日志级别决策流程：**
+
+```
+DropItem 异常抛出
+    ↓
+检查 exception.log_level 属性
+    ↓
+    ├─ 存在（非 None）→ 使用该级别
+    │
+    └─ 不存在（None）→ 回退到全局配置
+                        ↓
+                  读取 DEFAULT_DROPITEM_LOG_LEVEL
+                        ↓
+                  默认值："WARNING"
+```
+
+**LogFormatter.dropped 实现：**
+
+```python
+# scrapy/logformatter.py:115-134
+def dropped(
+    self,
+    item: Any,
+    exception: BaseException,
+    response: Response | Failure | None,
+    spider: Spider,
+) -> LogFormatterResult:
+    """Logs a message when an item is dropped while it is passing through the item pipeline."""
+    
+    # ========== 日志级别决策链 ==========
+    # 优先级 1：检查异常实例携带的 log_level
+    if (level := getattr(exception, "log_level", None)) is None:
+        # 优先级 2：回退到全局配置项
+        level = spider.crawler.settings["DEFAULT_DROPITEM_LOG_LEVEL"]
+    
+    # 字符串级别转换为 logging 模块常量
+    if isinstance(level, str):
+        level = getattr(logging, level)
+    
+    return {
+        "level": level,
+        "msg": DROPPEDMSG,
+        "args": {
+            "exception": exception,
+            "item": item,
+        },
+    }
+```
+
+**默认配置：**
+
+```python
+# scrapy/settings/default_settings.py:229
+DEFAULT_DROPITEM_LOG_LEVEL = "WARNING"
+```
+
+**日志级别决策表：**
+
+| 异常实例 `log_level` | 配置项 `DEFAULT_DROPITEM_LOG_LEVEL` | 实际日志级别 |
+|---------------------|------------------------------------|------------|
+| `"DEBUG"` | 任意 | `logging.DEBUG` |
+| `"INFO"` | 任意 | `logging.INFO` |
+| `"WARNING"` | 任意 | `logging.WARNING` |
+| `"ERROR"` | 任意 | `logging.ERROR` |
+| `"CRITICAL"` | 任意 | `logging.CRITICAL` |
+| `None` | `"DEBUG"` | `logging.DEBUG` |
+| `None` | `"INFO"` | `logging.INFO` |
+| `None` | `"WARNING"`（默认） | `logging.WARNING` |
+| `None` | `"ERROR"` | `logging.ERROR` |
+
+**使用示例：**
+
+```python
+from scrapy.exceptions import DropItem
+
+class FlexibleDropPipeline:
+    def process_item(self, item, spider):
+        if not item.get('url'):
+            # 严重问题：使用 ERROR 级别
+            raise DropItem("Item missing URL", log_level="ERROR")
+        
+        if not item.get('price'):
+            # 一般问题：使用默认 WARNING 级别
+            raise DropItem("Item missing price")  # log_level=None
+        
+        if item.get('category') == 'outdated':
+            # 调试信息：使用 DEBUG 级别
+            raise DropItem("Outdated category", log_level="DEBUG")
+        
+        return item
+```
+
+**不同日志级别对输出的影响：**
+
+| 日志级别 | `logging.root.level=WARNING` 时的输出 | 典型使用场景 |
+|---------|--------------------------------------|-------------|
+| `DEBUG` | ❌ 不输出 | 详细调试信息 |
+| `INFO` | ❌ 不输出 | 一般信息 |
+| `WARNING` | ✅ 输出 | 默认警告 |
+| `ERROR` | ✅ 输出 | 错误情况 |
+| `CRITICAL` | ✅ 输出 | 严重错误 |
+
+### 3.4 异常处理路径对比
 
 | 特性 | DropItem 异常 | 其他 Exception |
 |-----|--------------|---------------|
 | **信号触发** | `item_dropped` | `item_error` |
-| **日志级别** | 可配置（默认 WARNING） | ERROR |
+| **日志级别** | 可配置（默认 WARNING） | 固定 ERROR |
+| **日志级别来源** | 异常实例 `log_level` → 配置项 `DEFAULT_DROPITEM_LOG_LEVEL` | 硬编码 `logging.ERROR` |
 | **堆栈记录** | 不记录 `exc_info` | 记录完整堆栈 `exc_info=True` |
 | **后续 Pipeline** | 中断，不再执行 | 中断，不再执行 |
 | **Item 状态** | 视为"正常丢弃" | 视为"处理错误" |
 | **统计指标** | 统计为 dropped | 统计为 errors |
 
-### 3.4 使用示例
+### 3.5 使用示例
 
 ```python
 from scrapy.exceptions import DropItem
@@ -381,19 +672,19 @@ class ValidationPipeline:
     def process_item(self, item, spider):
         # 业务逻辑错误，应使用 DropItem
         if not item.get('url'):
-            raise DropItem("Item has no URL")
+            raise DropItem("Item has no URL", log_level="ERROR")  # 自定义日志级别
         
         # 非预期错误，让异常自然抛出
         # 这会被视为 item_error
         result = some_api_call(item)  # 可能抛出网络异常
         if result is None:
             # 这种情况更适合用 DropItem
-            raise DropItem("API returned no data")
+            raise DropItem("API returned no data", log_level="WARNING")
         
         return item
 ```
 
-### 3.5 责任链中断机制
+### 3.6 责任链中断机制
 
 **中断点位于 `_process_chain` 方法：**
 
@@ -442,6 +733,8 @@ Pipeline 的生命周期与 Scrapy 引擎的生命周期紧密协调，涉及多
 │  │  ┌───────────────────────────────────────────────────────┐  │ │
 │  │  │               Scraper (抓取器)                         │  │ │
 │  │  │  open_spider_async() / close_spider_async()          │  │ │
+│  │  │              ↓                                        │  │ │
+│  │  │  [_itemproc_has_async 判定]                          │  │ │
 │  │  │              ↓                                        │  │ │
 │  │  │  ┌─────────────────────────────────────────────────┐  │  │ │
 │  │  │  │        ItemPipelineManager (Pipeline 管理器)    │  │  │ │
@@ -556,7 +849,135 @@ async def _process_parallel_dfd(self, methodname: str) -> Deferred[list[None]]:
 - 各 Pipeline 的初始化互不依赖
 - 如果某个 Pipeline 的 `open_spider` 抛出异常，会阻止爬虫启动
 
-### 4.4 关闭爬虫执行时机
+### 4.4 并行生命周期钩子的失败处理差异
+
+**两种事件驱动模式下的失败处理有显著差异：**
+
+| 模式 | 实现方式 | 失败时的行为 | 已启动任务 |
+|-----|---------|------------|-----------|
+| **Asyncio 模式** | `asyncio.gather(*awaitables)` | 第一个异常立即抛出 | **不会取消**，继续运行直到完成 |
+| **Twisted 模式** | `DeferredList(..., fireOnOneErrback=True)` | 第一个失败触发 errback | **不会取消**，继续运行直到完成 |
+
+**Asyncio 模式实现（不会取消剩余任务）：**
+
+```python
+# scrapy/pipelines/__init__.py:91-110
+async def _process_parallel_asyncio(self, methodname: str) -> list[None]:
+    methods = cast(
+        "Iterable[Callable[..., Coroutine[Any, Any, None] | Deferred[None] | None]]",
+        self.methods[methodname],
+    )
+    if not methods:
+        return []
+
+    def get_awaitable(
+        method: Callable[..., Coroutine[Any, Any, None] | Deferred[None] | None],
+    ) -> Awaitable[None]:
+        if method in self._mw_methods_requiring_spider:
+            result = method(self._spider)
+        else:
+            result = method()
+        return ensure_awaitable(result, _warn=global_object_name(method))
+
+    awaitables = [get_awaitable(m) for m in methods]
+    # ========== 关键点 ==========
+    # asyncio.gather 没有 return_exceptions=True
+    # 但也没有 cancel 语义 - 异常抛出时其他任务继续运行
+    await asyncio.gather(*awaitables)
+    return [None for _ in methods]
+```
+
+**注意：** `asyncio.gather` 的行为：
+- 没有 `return_exceptions=True` 时，第一个异常会立即向上抛出
+- 但**不会取消**其他已启动的任务，它们会继续在后台运行
+- 调用方会收到异常，但其他任务可能还在执行
+
+**Twisted 模式实现：**
+
+```python
+# scrapy/pipelines/__init__.py:65-89
+def _process_parallel_dfd(self, methodname: str) -> Deferred[list[None]]:
+    methods = cast(
+        "Iterable[Callable[..., Coroutine[Any, Any, None] | Deferred[None] | None]]",
+        self.methods[methodname],
+    )
+
+    def get_dfd(
+        method: Callable[..., Coroutine[Any, Any, None] | Deferred[None] | None],
+    ) -> Deferred[None]:
+        if method in self._mw_methods_requiring_spider:
+            return _maybeDeferred_coro(method, True, self._spider)
+        return _maybeDeferred_coro(method, True)
+
+    dfds = [get_dfd(m) for m in methods]
+    # ========== 关键点 ==========
+    # fireOnOneErrback=True: 第一个失败立即触发整体 errback
+    # consumeErrors=True: 消费错误，避免未处理的错误
+    d: Deferred[list[tuple[bool, None]]] = DeferredList(
+        dfds, fireOnOneErrback=True, consumeErrors=True
+    )
+    d2: Deferred[list[None]] = d.addCallback(lambda r: [x[1] for x in r])
+
+    def eb(failure: Failure) -> Failure:
+        # 包装 FirstError，提取原始失败
+        assert isinstance(failure.value, FirstError)
+        return failure.value.subFailure
+
+    d2.addErrback(eb)
+    return d2
+```
+
+**DeferredList 参数说明：**
+
+| 参数 | 值 | 行为 |
+|-----|---|------|
+| `fireOnOneErrback` | `True` | 任一 Deferred 失败时，立即触发整体 errback |
+| `consumeErrors` | `True` | 消费原始错误，避免 `Unhandled error in Deferred` 警告 |
+
+**两种模式的失败处理对比：**
+
+```
+场景：Pipeline A、B、C 并行执行
+      - Pipeline A 立即失败
+      - Pipeline B 需要 1 秒完成
+      - Pipeline C 需要 2 秒完成
+
+时间线：
+t=0:  所有 Pipeline 开始执行
+t=0:  Pipeline A 失败
+
+Asyncio 模式 (asyncio.gather):
+┌─────────────────────────────────────────────────────┐
+│ t=0:  Pipeline A 失败 → 异常向上抛出                 │
+│ t=0:  Pipeline B 继续运行 (不会被取消)              │
+│ t=0:  Pipeline C 继续运行 (不会被取消)              │
+│ t=0:  调用方收到异常，但 B、C 仍在后台执行          │
+│ t=1:  Pipeline B 完成 (无感知)                       │
+│ t=2:  Pipeline C 完成 (无感知)                       │
+└─────────────────────────────────────────────────────┘
+
+Twisted 模式 (DeferredList with fireOnOneErrback=True):
+┌─────────────────────────────────────────────────────┐
+│ t=0:  Pipeline A 失败 → 触发 DeferredList errback   │
+│ t=0:  Pipeline B 继续运行 (Deferred 不会被取消)      │
+│ t=0:  Pipeline C 继续运行 (Deferred 不会被取消)      │
+│ t=0:  调用方收到 Failure，但 B、C 仍在运行            │
+│ t=1:  Pipeline B 完成 (consumeErrors=True，静默)     │
+│ t=2:  Pipeline C 完成 (consumeErrors=True，静默)     │
+└─────────────────────────────────────────────────────┘
+```
+
+**实际行为总结：**
+
+| 特性 | Asyncio 模式 | Twisted 模式 |
+|-----|-------------|-------------|
+| **第一个失败触发时间** | 立即 | 立即 |
+| **是否取消其他任务** | ❌ 否 | ❌ 否 |
+| **其他任务是否继续** | ✅ 是 | ✅ 是 |
+| **错误传播方式** | 异常抛出 | `FirstError` 包装后传递 |
+| **未处理错误警告** | 无 | `consumeErrors=True` 避免 |
+
+### 4.5 关闭爬虫执行时机
 
 **Engine 触发点：**
 
@@ -638,7 +1059,7 @@ def _check_if_closing(self) -> None:
         self.slot.closing.callback(self.crawler.spider)
 ```
 
-### 4.5 close_spider 的逆序执行
+### 4.6 close_spider 的逆序执行
 
 **方法注册时的特殊处理：**
 
@@ -665,7 +1086,7 @@ def _add_middleware(self, pipe: Any) -> None:
 
 **设计意图：** 模拟栈的行为，后打开的先关闭，确保资源依赖关系正确。
 
-### 4.6 生命周期钩子使用示例
+### 4.7 生命周期钩子使用示例
 
 ```python
 class DatabasePipeline:
@@ -685,7 +1106,7 @@ class DatabasePipeline:
             return item
         else:
             self.stats["dropped"] += 1
-            raise DropItem("Invalid item")
+            raise DropItem("Invalid item", log_level="DEBUG")
     
     async def close_spider_async(self):
         """爬虫关闭时清理资源，输出统计"""
@@ -768,7 +1189,197 @@ async def download_async(self, request: Request) -> Response:
     return response_or_request
 ```
 
-### 5.3 并发控制协作边界
+### 5.3 媒体下载中的事件循环协作设计
+
+**MediaPipeline 在下载流程中有两处主动让出事件循环控制权的时机，使用 `_defer_sleep_async()` 实现。**
+
+**延迟常量定义：**
+
+```python
+# scrapy/utils/defer.py:44
+_DEFER_DELAY = 0.1  # 100 毫秒，不可设为零
+```
+
+**让出事件循环的实现：**
+
+```python
+# scrapy/utils/defer.py:89-100
+async def _defer_sleep_async() -> None:
+    """Delay by _DEFER_DELAY so reactor has a chance to go through readers and writers
+    before attending pending delayed calls, so do not set delay to zero.
+    """
+    if is_asyncio_available():
+        # Asyncio 模式：使用 asyncio.sleep
+        await asyncio.sleep(_DEFER_DELAY)
+    else:
+        # Twisted 模式：使用 reactor.callLater + Deferred
+        from twisted.internet import reactor
+
+        d: Deferred[None] = Deferred()
+        reactor.callLater(_DEFER_DELAY, d.callback, None)
+        await d
+```
+
+**两处让出事件循环的时机：**
+
+```python
+# scrapy/pipelines/media.py:151-198
+async def _process_request(
+    self, request: Request, info: SpiderInfo, item: Any
+) -> FileInfo:
+    fp = self._fingerprinter.fingerprint(request)
+
+    # ========== 时机 1：缓存命中时让出 ==========
+    # 意图：让 I/O 读写事件优先处理，避免同步操作阻塞事件循环
+    if fp in info.downloaded:
+        await _defer_sleep_async()  # ← 第一处让出
+        cached_result = info.downloaded[fp]
+        if isinstance(cached_result, Failure):
+            if eb:
+                return eb(cached_result)
+            cached_result.raiseException()
+        return cached_result
+
+    # ... 准备等待 Deferred ...
+
+    # 检查是否正在下载
+    if fp in info.downloading:
+        return await maybe_deferred_to_future(wad)
+
+    # ========== 时机 2：开始新下载前让出 ==========
+    # 意图：延迟回调执行，让 reactor 有机会处理读写事件
+    info.downloading.add(fp)
+    await _defer_sleep_async()  # ← 第二处让出
+    
+    # ... 实际下载 ...
+    self._cache_result_and_execute_waiters(result, fp, info)
+    return await maybe_deferred_to_future(wad)
+```
+
+**第三处延迟回调（通知等待者）：**
+
+```python
+# scrapy/pipelines/media.py:227-265
+def _cache_result_and_execute_waiters(
+    self, result: FileInfo | Failure, fp: bytes, info: SpiderInfo
+) -> None:
+    # ... 缓存结果 ...
+    
+    info.downloading.remove(fp)
+    info.downloaded[fp] = result
+    
+    # 通知所有等待相同请求的 Deferred
+    for wad in info.waiting.pop(fp):
+        if isinstance(result, Failure):
+            # 使用 call_later 延迟回调
+            call_later(_DEFER_DELAY, wad.errback, result)  # ← 延迟 errback
+        else:
+            # 使用 call_later 延迟回调
+            call_later(_DEFER_DELAY, wad.callback, result)  # ← 延迟 callback
+```
+
+### 5.4 让出事件循环的意图与设计考量
+
+**为什么延迟值不可设为零？**
+
+```
+代码注释说明：
+"Delay by _DEFER_DELAY so reactor has a chance to go through readers and writers
+ before attending pending delayed calls, so do not set delay to zero."
+
+翻译：
+"延迟 _DEFER_DELAY 时间，让 reactor 有机会在处理待延迟调用之前，
+ 先处理读写事件，所以不要将延迟设为零。"
+```
+
+**事件循环协作示意图：**
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                        事件循环处理顺序                                      │
+├──────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  事件循环每次迭代的处理顺序：                                               │
+│                                                                          │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────────────────────┐ │
+│  │  I/O 读写    │ → │  定时器事件   │ → │  其他待处理事件 (Deferred)   │ │
+│  │  (高优先级)  │    │ (callLater) │    │      (低优先级)              │ │
+│  └─────────────┘    └─────────────┘    └─────────────────────────────┘ │
+│                                                                          │
+│  _defer_sleep_async() / call_later(_DEFER_DELAY, ...) 的作用：          │
+│  ┌────────────────────────────────────────────────────────────────────┐ │
+│  │  调用 callLater(0.1, callback) 会将回调放入"定时器事件"队列        │ │
+│  │  这样在下一次事件循环迭代时：                                        │ │
+│  │    1. 先处理所有 I/O 读写事件（网络数据到达、文件就绪等）            │ │
+│  │    2. 再处理定时器事件（包括我们的回调）                             │ │
+│  │  从而确保 I/O 事件优先处理，避免同步阻塞                              │ │
+│  └────────────────────────────────────────────────────────────────────┘ │
+│                                                                          │
+│  如果延迟设为 0 会怎样？                                                  │
+│  ┌────────────────────────────────────────────────────────────────────┐ │
+│  │  reactor.callLater(0, callback) 会在下一次迭代立即执行，             │ │
+│  │  但仍会在 I/O 处理之后。这本身没问题，但 Scrapy 选择 0.1 秒         │ │
+│  │  是为了：                                                             │ │
+│  │    - 给 I/O 事件足够的时间到达和处理                                   │ │
+│  │    - 避免过于频繁的回调导致事件循环繁忙                                │ │
+│  │    - 让批量操作有机会合并处理                                          │ │
+│  └────────────────────────────────────────────────────────────────────┘ │
+│                                                                          │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+**两种事件驱动模式下的实现差异：**
+
+| 维度 | Asyncio 模式 | Twisted 模式 |
+|-----|-------------|-------------|
+| **实现方式** | `asyncio.sleep(_DEFER_DELAY)` | `reactor.callLater(_DEFER_DELAY, d.callback)` + `await d` |
+| **延迟值** | 0.1 秒 | 0.1 秒 |
+| **事件循环交互** | asyncio 事件循环的 `sleep` 会让出控制权 | Twisted reactor 的 `callLater` 注册定时器事件 |
+| **I/O 优先保障** | ✅ sleep 结束后事件循环先处理 I/O | ✅ callLater 事件在 I/O 之后处理 |
+| **第三处延迟方式** | 使用 `call_later` 封装 | 直接使用 `reactor.callLater` |
+
+**三处让出/延迟的具体意图：**
+
+| 位置 | 代码位置 | 意图 | 场景示例 |
+|-----|---------|------|---------|
+| **时机 1** | 缓存命中后 | 避免同步缓存返回阻塞事件循环 | 大量 Item 请求同一已缓存图片，避免同步操作堆积 |
+| **时机 2** | 开始新下载前 | 让 I/O 事件优先处理，避免延迟敏感的 I/O 被忽略 | 网络数据包到达时，优先处理已有响应 |
+| **时机 3** | 通知等待者时 | 延迟回调，避免当前调用栈过长 | 多个 Item 等待同一下载，避免同步回调链 |
+
+**实际场景示例：**
+
+```
+场景：1000 个 Item 都需要下载同一张图片 "logo.png"
+
+时间线：
+t=0:    Item 1 发起请求
+         - fp = fingerprint(request)
+         - fp 不在 downloading 中
+         - await _defer_sleep_async()  ← 让出，让其他 I/O 先处理
+t=0.1:  Item 1 开始实际下载
+         - info.downloading.add(fp)
+         - 调用 engine.download_async()
+
+t=0.05: Item 2 发起请求（在 Item 1 的 _defer_sleep_async 期间）
+         - fp 已在 downloading 中
+         - 直接等待 wad Deferred
+
+t=0.08: Item 3 发起请求
+         - 同样直接等待
+
+... 更多 Item 等待 ...
+
+t=0.5:  Item 1 的下载完成
+         - 调用 _cache_result_and_execute_waiters()
+         - 对于 Item 2、3、...：
+           call_later(0.1, wad.callback, result)  ← 延迟通知
+         - 这样事件循环可以先处理其他 I/O，再处理回调
+
+t=0.6:  所有等待的 Item 收到回调
+         - 各自继续处理
+```
+
+### 5.5 并发控制协作边界
 
 **全局下载器的并发控制：**
 
@@ -818,7 +1429,7 @@ def _process_queue(self, slot: Slot) -> None:
         # ...
 ```
 
-### 5.4 MediaPipeline 内部的去重和复用机制
+### 5.6 MediaPipeline 内部的去重和复用机制
 
 **MediaPipeline 有自己的一层请求去重，避免重复下载相同 URL：**
 
@@ -881,7 +1492,7 @@ def _cache_result_and_execute_waiters(
             call_later(_DEFER_DELAY, wad.callback, result)
 ```
 
-### 5.5 并发控制协作图
+### 5.7 并发控制协作图
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────────┐
@@ -915,12 +1526,16 @@ def _cache_result_and_execute_waiters(
 │  │   - downloading: set[bytes]  ← 正在下载的请求指纹（去重）             │  │
 │  │   - downloaded: dict[bytes, result]  ← 已下载结果（缓存）             │  │
 │  │   - waiting: dict[bytes, list[Deferred]]  ← 等待相同请求的回调       │  │
+│  │                                                                       │  │
+│  │ 事件循环协作：                                                         │  │
+│  │   - _defer_sleep_async(): 缓存命中/开始下载前让出事件循环              │  │
+│  │   - call_later(_DEFER_DELAY, ...): 延迟通知等待者                     │  │
 │  └──────────────────────────────────────────────────────────────────────┘  │
 │                                                                              │
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 5.6 并发预算共享机制
+### 5.8 并发预算共享机制
 
 **关键理解：MediaPipeline 没有独立的并发限制，所有下载请求都受全局 Downloader 并发限制。**
 
@@ -949,7 +1564,7 @@ CONCURRENT_REQUESTS_PER_DOMAIN = 8
 - 同一域名的请求（页面 + 图片）总数不超过 8
 - 全局请求总数不超过 16
 
-### 5.7 process_item 的并行下载
+### 5.9 process_item 的并行下载
 
 **MediaPipeline 的 process_item 实现：**
 
@@ -989,42 +1604,9 @@ async def process_item(self, item: Any, spider: Spider | None = None) -> Any:
 2. 但这些请求仍受全局 Downloader 的并发限制
 3. `asyncio.gather(return_exceptions=True)` 确保单个下载失败不影响其他下载
 
-### 5.8 协作边界总结
+### 5.10 协作边界总结
 
 | 维度 | 全局 Downloader | MediaPipeline 内部 |
 |-----|-----------------|-------------------|
 | **并发控制** | ✅ 控制总并发和域名并发 | ❌ 无并发控制 |
-| **请求去重** | ❌ 不做去重（重复请求会重复下载） | ✅ 基于指纹的去重（相同请求只下载一次） |
-| **结果缓存** | ❌ 无内置缓存 | ✅ 已下载结果缓存到 SpiderInfo |
-| **等待协调** | ❌ 无 | ✅ 多个 Item 等待相同下载的协调 |
-| **失败处理** | 通过 middleware 处理重试 | 记录失败，继续处理其他 |
-
----
-
-## 附录：核心模块文件索引
-
-| 功能模块 | 文件路径 | 关键类/方法 |
-|---------|---------|------------|
-| **Pipeline 管理器** | `scrapy/pipelines/__init__.py` | `ItemPipelineManager`, `_process_chain`, `_process_parallel` |
-| **中间件基类** | `scrapy/middleware.py` | `MiddlewareManager`, `_process_chain` |
-| **异步工具** | `scrapy/utils/defer.py` | `ensure_awaitable`, `maybe_deferred_to_future` |
-| **抓取器** | `scrapy/core/scraper.py` | `Scraper`, `start_itemproc_async` |
-| **引擎** | `scrapy/core/engine.py` | `ExecutionEngine`, `open_spider_async`, `close_spider_async` |
-| **下载器** | `scrapy/core/downloader/__init__.py` | `Downloader`, `Slot` |
-| **媒体 Pipeline** | `scrapy/pipelines/media.py` | `MediaPipeline`, `SpiderInfo` |
-| **异常定义** | `scrapy/exceptions.py` | `DropItem` |
-| **默认配置** | `scrapy/settings/default_settings.py` | `ITEM_PIPELINES`, `CONCURRENT_*` 等 |
-
----
-
-## 关键设计模式总结
-
-1. **责任链模式（Chain of Responsibility）**: `_process_chain` 实现了异步责任链，每个 Pipeline 处理后传递给下一个
-2. **并行执行模式**: `open_spider`/`close_spider` 使用 `asyncio.gather` 或 `DeferredList` 并行执行
-3. **模板方法模式**: `MediaPipeline` 定义了下载流程骨架，子类实现具体的 `get_media_requests`、`media_downloaded` 等方法
-4. **享元模式**: `SpiderInfo` 缓存下载结果，避免重复下载相同资源
-5. **适配器模式**: `ensure_awaitable` 统一处理同步返回值、Deferred 和协程
-
----
-
-*分析基于 Scrapy 源码版本：2.x（来自 `g:\fangzheng\solo-dogfeeding\code\scrapy-10064`）*
+| **请求去重** | ❌ 不做去重（重复请求会重复下载） | ✅ 基于指纹的
