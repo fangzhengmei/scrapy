@@ -84,14 +84,59 @@ def _add_middleware(self, mw: Any) -> None:
 
 #### 1.1.3 执行流程
 
-完整的响应处理流程在 `scrape_response_async` 方法（`spidermw.py:407-436`）中实现：
+完整的响应处理流程在 `scrape_response_async` 方法（`spidermw.py:407-436`）中实现。
 
+**正常流程**：
 ```
 响应 → process_spider_input 链 → Spider 回调函数 → 
 process_spider_output 链 → 输出 (Items/Requests)
-         ↑
-         └─ 异常时触发 process_spider_exception 链
 ```
+
+**⚠️ 异常流程修正：两种情况下异常处理链均不介入**
+
+根据源代码（`spidermw.py:148-171`），`process_spider_input` 抛出的异常**不会进入** `process_spider_exception` 链：
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│         process_spider_input 异常流程（修正后）                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  响应 → process_spider_input 链                                 │
+│                │                                               │
+│                ▼                                               │
+│         ┌──────────────┐                                        │
+│         │  抛出异常    │                                        │
+│         └──────┬───────┘                                        │
+│                │                                               │
+│    ┌───────────┴───────────┐                                    │
+│    ▼                       ▼                                    │
+│ ┌─────────┐          ┌───────────────┐                         │
+│ │普通异常 │          │_InvalidOutput │                         │
+│ │ (其他)  │          │ (返回非法值)   │                         │
+│ └────┬────┘          └───────┬───────┘                         │
+│      │                       │                                   │
+│      ▼                       ▼                                   │
+│ ┌─────────────────┐   ┌─────────────────┐                       │
+│ │调用 Spider      │   │直接向上抛出      │                       │
+│ │错误回调         │   │                 │                       │
+│ │scrape_func(     │   │                 │                       │
+│ │  Failure(), req)│   │                 │                       │
+│ └────────┬────────┘   └────────┬────────┘                       │
+│          │                       │                               │
+│          ▼                       ▼                               │
+│  ❌ 不会进入      │        ❌ 不会进入      │                       │
+│  process_spider_ │        process_spider_ │                       │
+│  exception 链    │        exception 链    │                       │
+│  (即使到达也会被  │        (被立即跳过)    │                       │
+│   立即跳过)       │                         │                       │
+│                  │                         │                       │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**总结**：
+- **普通异常**：调用 `scrape_func(Failure(), request)`，转给 Spider 的 errback 处理，不进入异常处理链
+- **`_InvalidOutput` 异常**：直接 `raise`，且 `process_spider_exception` 方法开头会检查并立即跳过，不进入异常处理链
+- 两种情况下，`process_spider_exception` 链**均不介入**
 
 ### 1.2 下载中间件责任链结构
 
@@ -425,6 +470,62 @@ else:
 ```
 
 这意味着如果 `process_spider_exception` 返回一个可迭代对象，该对象会被合并到输出流中，实现优雅降级。
+
+**⚠️ 重要约束：异步可迭代对象被禁止**
+
+`process_spider_exception` 方法在"返回可迭代对象实现优雅降级"这一能力上有一个关键约束：**只能返回同步可迭代对象，不能返回异步可迭代对象**。
+
+**源代码分析**（`spidermw.py:237-251`）：
+
+```python
+if _isiterable(result):
+    # 调用 _process_spider_output 处理返回的可迭代对象
+    dfd: Deferred[MutableChain[_T] | MutableAsyncChain[_T]] = (
+        self._process_spider_output(response, result, method_index + 1)
+    )
+    
+    # 关键检查：结果是否立即可用
+    if dfd.called:
+        # 结果立即可用（没有降级异步迭代器），可以返回
+        return cast("MutableChain[_T] | MutableAsyncChain[_T]", dfd.result)
+    
+    # 结果不可用，需要等待 → 抛出错误
+    # we forbid waiting here because otherwise we would need to return a deferred from
+    # _process_spider_exception too, which complicates the architecture
+    msg = f"Async iterable returned from {global_object_name(method)} cannot be downgraded"
+    raise _InvalidOutput(msg)
+```
+
+**设计原因分析**：
+
+| 设计决策 | 说明 |
+|---------|------|
+| `_process_spider_exception` 是同步方法 | 不是 `async def`，不能使用 `await` |
+| 返回值要求立即可用 | 如果返回异步可迭代对象，`_process_spider_output` 需要降级处理，返回的 Deferred 不会立即完成 |
+| 架构复杂度考量 | 如果要支持异步结果，`_process_spider_exception` 需要返回 Deferred，这会使整个异常处理架构变得复杂 |
+
+**对开发者的影响**：
+
+```python
+# ✅ 正确：返回同步可迭代对象
+def process_spider_exception(self, response, exception, spider):
+    if isinstance(exception, MyCustomError):
+        # 返回列表或生成器都是可以的
+        return [self.create_fallback_item(response)]
+    return None
+
+# ❌ 错误：返回异步可迭代对象
+async def process_spider_exception_async(self, response, exception, spider):
+    if isinstance(exception, MyCustomError):
+        # 异步生成器会导致 _process_spider_output 返回未完成的 Deferred
+        yield await self.create_fallback_item_async(response)
+        # ❌ 会抛出 _InvalidOutput: "Async iterable returned from ... cannot be downgraded"
+```
+
+**总结**：
+- `process_spider_exception` 的同步架构要求结果必须立即可用
+- 只有当 `_process_spider_output` 不需要降级处理（即返回同步可迭代对象）时，优雅降级才能正常工作
+- 如果需要在异常处理中执行异步操作，应该考虑其他方式（如信号处理或在其他中间件方法中处理）
 
 ---
 
