@@ -29,17 +29,21 @@
 
 ## 1. Spider 中间件与下载中间件责任链结构对比
 
-### 1.1 Spider 中间件三类处理方法及责任链结构
+### 1.1 Spider 中间件四类处理方法及责任链结构
 
-Spider 中间件是 Scrapy 架构中处理 Spider 输入输出的关键组件，位于 `scrapy/core/spidermw.py`。它定义了三类核心处理方法：
+Spider 中间件是 Scrapy 架构中处理 Spider 输入输出的关键组件，位于 `scrapy/core/spidermw.py`。它定义了四类核心处理方法：
 
-#### 1.1.1 三类处理方法定义
+#### 1.1.1 四类处理方法定义
 
-| 方法名 | 职责 | 输入参数 | 期望返回值 |
-|--------|------|----------|------------|
-| `process_spider_input` | 处理来自下载器的响应 | `response`, `spider` (可选) | `None` 或抛出异常 |
-| `process_spider_output` | 处理爬虫产出的输出 | `response`, `result`, `spider` (可选) | 可迭代对象 (Iterable/AsyncIterator) |
-| `process_spider_exception` | 处理链路中发生的异常 | `response`, `exception`, `spider` (可选) | `None` 或可迭代对象 |
+| 方法名 | 职责 | 输入参数 | 期望返回值 | 执行顺序 |
+|--------|------|----------|------------|----------|
+| `process_start` | 处理爬虫启动时的初始请求流（新版异步） | `spider` (可选) | `AsyncIterator` 或 `None` | 反向 |
+| `process_start_requests` | 处理爬虫启动时的初始请求流（旧版同步，已废弃） | `start_requests`, `spider` (可选) | 可迭代对象 | 反向 |
+| `process_spider_input` | 处理来自下载器的响应 | `response`, `spider` (可选) | `None` 或抛出异常 | 正向 |
+| `process_spider_output` | 处理爬虫产出的输出 | `response`, `result`, `spider` (可选) | 可迭代对象 (Iterable/AsyncIterator) | 反向 |
+| `process_spider_exception` | 处理链路中发生的异常 | `response`, `exception`, `spider` (可选) | `None` 或**同步**可迭代对象 | 反向 |
+
+> **注意**：`process_spider_exception` 只能返回同步可迭代对象，不能返回异步可迭代对象。详见 [2.2.4 异常恢复机制](#224-异常恢复机制)。
 
 #### 1.1.2 责任链构建机制
 
@@ -51,6 +55,15 @@ def _add_middleware(self, mw: Any) -> None:
     if hasattr(mw, "process_spider_input"):
         self.methods["process_spider_input"].append(mw.process_spider_input)
         self._check_mw_method_spider_arg(mw.process_spider_input)
+
+    # process_start / process_start_requests: 使用 appendleft，按配置顺序反向添加
+    if self._use_start_requests:
+        if hasattr(mw, "process_start_requests"):
+            self.methods["process_start_requests"].appendleft(
+                mw.process_start_requests
+            )
+    elif hasattr(mw, "process_start"):
+        self.methods["process_start"].appendleft(mw.process_start)
 
     # process_spider_output: 使用 appendleft，按配置顺序反向添加
     process_spider_output = self._get_async_method_pair(mw, "process_spider_output")
@@ -64,9 +77,10 @@ def _add_middleware(self, mw: Any) -> None:
 ```
 
 **核心观察**：
-- `process_spider_input` 使用 `append` → 列表顺序 = 配置顺序
-- `process_spider_output` 使用 `appendleft` → 列表顺序 = 配置逆序
-- `process_spider_exception` 使用 `appendleft` → 列表顺序 = 配置逆序
+- `process_spider_input` 使用 `append` → 列表顺序 = 配置顺序（正向执行）
+- `process_start` / `process_start_requests` 使用 `appendleft` → 列表顺序 = 配置逆序（反向执行）
+- `process_spider_output` 使用 `appendleft` → 列表顺序 = 配置逆序（反向执行）
+- `process_spider_exception` 使用 `appendleft` → 列表顺序 = 配置逆序（反向执行）
 
 #### 1.1.3 执行流程
 
