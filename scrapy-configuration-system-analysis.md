@@ -483,7 +483,245 @@ class MyAddon:
 
 ## 4. 项目配置层（project，优先级20）
 
-### 4.1 项目配置的真实加载来源
+### 4.1 多层级配置文件发现机制
+
+项目配置的发现从 `scrapy.cfg` 文件开始。Scrapy 支持**多层级**的配置文件，从系统级到用户级再到项目级，按顺序合并。
+
+#### 4.1.1 配置文件发现源
+
+`get_sources()` 函数定义了配置文件的多层级发现路径：
+
+```python
+def get_sources(use_closest: bool = True) -> list[str]:
+    xdg_config_home = (
+        os.environ.get("XDG_CONFIG_HOME") or Path("~/.config").expanduser()
+    )
+    sources = [
+        "/etc/scrapy.cfg",                    # 1. Linux 系统级配置
+        r"c:\scrapy\scrapy.cfg",              # 2. Windows 系统级配置
+        str(Path(xdg_config_home) / "scrapy.cfg"),  # 3. XDG 用户配置
+        str(Path("~/.scrapy.cfg").expanduser()),     # 4. 用户主目录配置
+    ]
+    if use_closest:
+        sources.append(closest_scrapy_cfg())  # 5. 项目级配置（向上遍历目录）
+    return sources
+```
+
+**关键代码位置**: `scrapy/utils/conf.py:112-124`
+
+#### 4.1.2 配置文件层级及查找路径
+
+| 层级 | 路径（Linux/macOS） | 路径（Windows） | 说明 | 优先级 |
+|------|---------------------|-----------------|------|--------|
+| 系统级 | `/etc/scrapy.cfg` | `c:\scrapy\scrapy.cfg` | 系统全局配置，适用于所有用户 | 最低 |
+| XDG 用户级 | `~/.config/scrapy.cfg` | （同用户主目录） | 遵循 XDG Base Directory 规范 | 低 |
+| 用户主目录级 | `~/.scrapy.cfg` | `%USERPROFILE%\.scrapy.cfg` | 用户个人配置 | 中 |
+| 项目级 | （向上遍历找到的最近的 `scrapy.cfg`） | （向上遍历找到的最近的 `scrapy.cfg`） | 当前项目的配置 | 最高 |
+
+#### 4.1.3 项目级配置文件发现机制：向上遍历目录
+
+`closest_scrapy_cfg()` 函数负责从当前目录向上遍历查找项目级配置文件：
+
+```python
+def closest_scrapy_cfg(
+    path: str | os.PathLike = ".",
+    prevpath: str | os.PathLike | None = None,
+) -> str:
+    """Return the path to the closest scrapy.cfg file by traversing the current
+    directory and its parents
+    """
+    if prevpath is not None and str(path) == str(prevpath):
+        return ""  # 到达文件系统根目录，停止遍历
+    path = Path(path).resolve()
+    cfgfile = path / "scrapy.cfg"
+    if cfgfile.exists():
+        return str(cfgfile)  # 找到配置文件，返回其路径
+    return closest_scrapy_cfg(path.parent, path)  # 向上遍历父目录
+```
+
+**关键代码位置**: `scrapy/utils/conf.py:73-87`
+
+**查找逻辑详解**：
+
+```
+示例目录结构：
+/
+├── etc/
+│   └── scrapy.cfg          ← 系统级配置
+└── home/
+    └── user/
+        ├── .config/
+        │   └── scrapy.cfg  ← XDG 用户配置
+        ├── .scrapy.cfg     ← 用户主目录配置
+        └── projects/
+            └── myproject/   ← 当前工作目录
+                ├── scrapy.cfg  ← 项目级配置（会找到这个）
+                ├── myproject/
+                │   ├── settings.py
+                │   └── spiders/
+                └── scrapy.cfg（同名？会先找到父目录的）
+```
+
+**查找流程**：
+1. 从当前目录 `/home/user/projects/myproject` 开始
+2. 检查是否存在 `scrapy.cfg` → 找到！
+3. 返回其绝对路径 `/home/user/projects/myproject/scrapy.cfg`
+
+**如果当前目录没有 `scrapy.cfg`**：
+1. 从当前目录开始，没找到
+2. 向上遍历到父目录 `/home/user/projects`，检查是否有 `scrapy.cfg`
+3. 如果还没找到，继续向上到 `/home/user`
+4. 再向上到 `/home`
+5. 再向上到 `/`
+6. 再次尝试向上到 `/`，发现路径不再变化 → 返回空字符串
+
+#### 4.1.4 多层级配置文件的合并规则
+
+`get_config()` 函数使用 Python 标准库的 `ConfigParser.read()` 方法合并多层级配置：
+
+```python
+def get_config(use_closest: bool = True) -> ConfigParser:
+    """Get Scrapy config file as a ConfigParser"""
+    sources = get_sources(use_closest)  # 获取所有配置文件路径列表
+    cfg = ConfigParser()
+    cfg.read(sources)  # 按顺序读取所有配置文件
+    return cfg
+```
+
+**关键代码位置**: `scrapy/utils/conf.py:104-109`
+
+**`ConfigParser.read()` 的合并规则**：
+
+```
+读取顺序（从先到后）：
+1. /etc/scrapy.cfg                    → 系统级（优先级最低）
+2. c:\scrapy\scrapy.cfg               → Windows 系统级
+3. ~/.config/scrapy.cfg                → XDG 用户级
+4. ~/.scrapy.cfg                       → 用户主目录级
+5. 项目目录/scrapy.cfg                 → 项目级（优先级最高）
+
+合并规则：
+- ConfigParser.read() 按顺序读取列表中的所有文件
+- **后读取的配置会覆盖先读取的同名配置**
+- 这意味着项目级配置优先级最高，系统级配置优先级最低
+```
+
+**合并示例**：
+
+假设存在以下配置文件：
+
+```ini
+; /etc/scrapy.cfg （系统级）
+[settings]
+default = system.settings
+LOG_LEVEL = DEBUG
+
+[deploy]
+url = http://prod.example.com:6800/
+```
+
+```ini
+; ~/.scrapy.cfg （用户级）
+[settings]
+default = user.settings
+LOG_LEVEL = INFO
+```
+
+```ini
+; /home/user/myproject/scrapy.cfg （项目级）
+[settings]
+default = myproject.settings
+LOG_LEVEL = WARNING
+```
+
+**合并结果**：
+```
+[settings]
+default = myproject.settings  # 项目级覆盖用户级，用户级覆盖系统级
+LOG_LEVEL = WARNING           # 项目级覆盖用户级，用户级覆盖系统级
+
+[deploy]
+url = http://prod.example.com:6800/  # 只有系统级配置，保持不变
+```
+
+#### 4.1.5 scrapy.cfg 的作用
+
+`scrapy.cfg` 文件的**主要作用**是：
+
+1. **指定 settings 模块路径**：通过 `[settings]` 部分的配置项指定实际的 Python 配置模块
+2. **多项目/多环境支持**：可以配置多个项目或多个环境，通过 `SCRAPY_PROJECT` 环境变量切换
+
+**示例 `scrapy.cfg`**：
+```ini
+[settings]
+default = myproject.settings
+production = myproject.settings_production
+testing = myproject.settings_testing
+
+[deploy]
+url = http://localhost:6800/
+project = myproject
+```
+
+**使用方式**：
+```bash
+# 使用默认配置
+scrapy crawl myspider
+
+# 使用生产环境配置
+export SCRAPY_PROJECT=production
+scrapy crawl myspider
+
+# 使用测试环境配置
+export SCRAPY_PROJECT=testing
+scrapy crawl myspider
+```
+
+#### 4.1.6 完整发现流程：从多层级配置文件到配置模块路径
+
+```
+完整的项目配置发现链路：
+
+1. get_sources() - 收集多层级配置文件路径
+   ├── /etc/scrapy.cfg                      ← 系统级
+   ├── c:\scrapy\scrapy.cfg                 ← Windows 系统级
+   ├── ~/.config/scrapy.cfg                 ← XDG 用户级
+   ├── ~/.scrapy.cfg                        ← 用户主目录级
+   └── 项目目录/scrapy.cfg                  ← 项目级（通过 closest_scrapy_cfg() 发现）
+                ↓
+2. ConfigParser.read(sources) - 合并多层级配置
+   └── 按顺序读取所有文件
+   └── 后读取的配置覆盖先读取的同名配置
+   └── 最终得到合并后的 ConfigParser 对象
+                ↓
+3. init_env(project) - 从合并后的配置中读取 settings 模块路径
+   ┌─────────────────────────────────────────────────────────┐
+   │ 示例合并后的配置：                                         │
+   │ [settings]                                                │
+   │ default = myproject.settings                              │
+   │ production = myproject.settings_production                │
+   │                                                           │
+   │ 根据 SCRAPY_PROJECT 环境变量（默认为 "default"）选择：     │
+   │ project = "default" → cfg.get("settings", "default")     │
+   │                      → "myproject.settings"               │
+   │                                                           │
+   │ 设置环境变量：                                             │
+   │ os.environ["SCRAPY_SETTINGS_MODULE"] = "myproject.settings" │
+   └─────────────────────────────────────────────────────────┘
+                ↓
+4. settings.setmodule(settings_module_path, "project") - 加载实际的配置
+   ┌─────────────────────────────────────────────────────────┐
+   │ 导入 settings 模块（如 myproject.settings）              │
+   │ 遍历模块中所有大写变量名                                   │
+   │ 以 priority=20 写入配置                                   │
+   │                                                           │
+   │ 示例：                                                    │
+   │ LOG_LEVEL = 'WARNING'    → settings['LOG_LEVEL']        │
+   │ DOWNLOAD_DELAY = 1       → settings['DOWNLOAD_DELAY']   │
+   └─────────────────────────────────────────────────────────┘
+```
+
+### 4.2 项目配置的真实加载来源
 
 项目配置层的核心加载入口是 `get_project_settings()` 函数：
 
@@ -1005,6 +1243,9 @@ Spider
 | 蜘蛛自定义配置 | `scrapy/spiders/__init__.py` | 42, 169-171 |
 | Crawler 配置合并 | `scrapy/crawler.py` | 56-71 |
 | Crawler 配置锁定 | `scrapy/crawler.py` | 93-146 |
+| 配置文件发现源列表 | `scrapy/utils/conf.py` | 112-124 |
+| 项目级配置文件发现（向上遍历） | `scrapy/utils/conf.py` | 73-87 |
+| 多层级配置合并 | `scrapy/utils/conf.py` | 104-109 |
 | 项目配置加载 | `scrapy/utils/project.py` | 66-91 |
 | 有效环境变量列表 | `scrapy/utils/project.py` | 76-81 |
 | 默认配置 | `scrapy/settings/default_settings.py` | 全文 |
