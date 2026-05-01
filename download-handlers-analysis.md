@@ -49,6 +49,8 @@ DOWNLOAD_HANDLERS_BASE = {
     "s3": "scrapy.core.downloader.handlers.s3.S3DownloadHandler",
     "ftp": "scrapy.core.downloader.handlers.ftp.FTPDownloadHandler",
 }
+
+DOWNLOAD_HANDLERS = {}  # 用户配置，默认为空
 ```
 
 | 协议 | 处理器类 | 说明 |
@@ -77,11 +79,209 @@ DOWNLOAD_HANDLERS = {
 
 ---
 
-## 3. 继承关系与职责定位（修正版）
+## 3. 配置合并与禁用协议的真实生效环节（修正版）
 
-### 3.1 继承层次结构
+### 3.1 配置合并的真实实现
 
-**关键修正**：`H2DownloadHandler` 直接继承 `BaseDownloadHandler`，**不是** `BaseHttpDownloadHandler`！
+**之前的描述**：使用了简化的伪代码逻辑
+
+**正确事实**：`getwithbase()` 方法实际创建新的 `BaseSettings` 对象并执行两次 `update()`
+
+#### 3.1.1 真实代码实现
+
+```python
+# scrapy/settings/__init__.py:325
+def getwithbase(self, name: _SettingsKey) -> BaseSettings:
+    """Get a composition of a dictionary-like setting and its ``_BASE``
+    counterpart.
+    """
+    if not isinstance(name, str):
+        raise ValueError(f"Base setting key must be a string, got {name}")
+    
+    # 创建新的 BaseSettings 对象
+    compbs = BaseSettings()
+    
+    # 第一步：先更新默认配置
+    compbs.update(self[name + "_BASE"])
+    
+    # 第二步：再更新用户配置（覆盖默认）
+    compbs.update(self[name])
+    
+    return compbs
+```
+
+#### 3.1.2 配置合并流程图
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  配置合并流程（getwithbase("DOWNLOAD_HANDLERS")）           │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│  1. 创建新的 BaseSettings 对象 (compbs)                      │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│  2. 第一次 update: compbs.update(self["DOWNLOAD_HANDLERS_BASE"]) │
+│                                                              │
+│  此时 compbs 内容：                                          │
+│  {                                                           │
+│    "http": "HTTP11DownloadHandler",                         │
+│    "https": "HTTP11DownloadHandler",                        │
+│    "ftp": "FTPDownloadHandler",                             │
+│    "data": "DataURIDownloadHandler",                        │
+│    "file": "FileDownloadHandler",                           │
+│    "s3": "S3DownloadHandler"                                │
+│  }                                                           │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│  3. 第二次 update: compbs.update(self["DOWNLOAD_HANDLERS"]) │
+│                                                              │
+│  假设用户配置：                                              │
+│  {                                                           │
+│    "ftp": None,                    # 禁用 FTP               │
+│    "https": "H2DownloadHandler"    # 覆盖 HTTPS 处理器    │
+│  }                                                           │
+│                                                              │
+│  此时 compbs 内容：                                          │
+│  {                                                           │
+│    "http": "HTTP11DownloadHandler",     # 保留默认         │
+│    "https": "H2DownloadHandler",        # 用户覆盖         │
+│    "ftp": None,                       # 被设为 None        │
+│    "data": "DataURIDownloadHandler",  # 保留默认         │
+│    "file": "FileDownloadHandler",      # 保留默认         │
+│    "s3": "S3DownloadHandler"          # 保留默认         │
+│  }                                                           │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 3.2 禁用协议的真实生效环节
+
+**关键发现**：禁用协议的生效不是在 `getwithbase()` 中，而是在 `DownloadHandlers.__init__()` 中的 `without_none_values()` 调用
+
+#### 3.2.1 真实生效流程
+
+```python
+# scrapy/core/downloader/handlers/__init__.py:60
+def __init__(self, crawler: Crawler):
+    # ...
+    
+    # 关键：without_none_values 会过滤掉值为 None 的键值对
+    handlers: dict[str, str | Callable[..., Any]] = without_none_values(
+        cast(
+            "dict[str, str | Callable[..., Any]]",
+            crawler.settings.getwithbase("DOWNLOAD_HANDLERS"),
+        )
+    )
+    
+    # 只有过滤后的协议才会被注册
+    for scheme, clspath in handlers.items():
+        self._schemes[scheme] = clspath
+        self._load_handler(scheme, skip_lazy=True)
+```
+
+#### 3.2.2 `without_none_values` 实现
+
+```python
+# scrapy/utils/python.py:257
+def without_none_values(
+    iterable: Mapping[_KT, _VT] | Iterable[_KT],
+) -> dict[_KT, _VT] | Iterable[_VT]:
+    """Return a copy of ``iterable`` with all ``None`` entries removed.
+    
+    If ``iterable`` is a mapping, return a dictionary where all pairs that have
+    value ``None`` have been removed.
+    """
+    if isinstance(iterable, Mapping):
+        # 关键：值为 None 的键值对不会被保留
+        return {k: v for k, v in iterable.items() if v is not None}
+    
+    # 其他类型的处理...
+    return type(iterable)(v for v in iterable if v is not None)
+```
+
+#### 3.2.3 完整禁用流程图
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  用户设置: DOWNLOAD_HANDLERS = {"ftp": None, "https": "H2Handler"} │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│  1. getwithbase("DOWNLOAD_HANDLERS")                        │
+│     → 合并后的结果:                                           │
+│     {                                                        │
+│       "http": "HTTP11Handler",                              │
+│       "https": "H2Handler",      # 用户覆盖                │
+│       "ftp": None,               # 被设为 None             │
+│       "data": "DataURIHandler",                            │
+│       "file": "FileHandler",                               │
+│       "s3": "S3Handler"                                   │
+│     }                                                        │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│  2. without_none_values(merged_config)                      │
+│     → 过滤掉值为 None 的键值对                               │
+│     → 结果:                                                  │
+│     {                                                        │
+│       "http": "HTTP11Handler",                              │
+│       "https": "H2Handler",                                 │
+│       # "ftp" 被移除了！                                    │
+│       "data": "DataURIHandler",                            │
+│       "file": "FileHandler",                               │
+│       "s3": "S3Handler"                                   │
+│     }                                                        │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│  3. 注册到 self._schemes                                      │
+│     → self._schemes 内容:                                    │
+│     {                                                        │
+│       "http": "HTTP11Handler",                              │
+│       "https": "H2Handler",                                 │
+│       "data": "DataURIHandler",                            │
+│       "file": "FileHandler",                               │
+│       "s3": "S3Handler"                                    │
+│       # 注意：没有 "ftp"！                                  │
+│     }                                                        │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│  4. 请求 "ftp://example.com/file" 时                         │
+│     → _get_handler("ftp")                                   │
+│     → "ftp" not in self._schemes                            │
+│     → self._notconfigured["ftp"] = "no handler available for that scheme" │
+│     → 抛出 NotSupported 异常                                │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 3.3 配置合并与禁用协议关键事实汇总
+
+| 环节 | 之前的描述 | 正确事实 |
+|------|-----------|---------|
+| 配置合并 | 简化伪代码 | `getwithbase()` 创建新 `BaseSettings`，先 `update(_BASE)` 再 `update(用户配置)` |
+| 禁用协议生效 | 在 `getwithbase()` 中过滤 | 在 `DownloadHandlers.__init__()` 中的 `without_none_values()` 过滤 |
+| 禁用标记 | 值为 `None` 的协议被移除 | 值为 `None` 的协议不会被注册到 `self._schemes` |
+| 请求时检查 | 检查 `self._handlers` | 首先检查 `self._schemes`，未注册则记录到 `self._notconfigured` |
+
+---
+
+## 4. 继承关系与职责定位（修正版）
+
+### 4.1 继承层次结构
+
+**关键修正 1**：`H2DownloadHandler` 直接继承 `BaseDownloadHandler`，**不是** `BaseHttpDownloadHandler`
+
+**新增发现**：`HttpxDownloadHandler` 继承 `BaseHttpDownloadHandler`，用于非 Twisted 运行模式
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -111,23 +311,27 @@ DOWNLOAD_HANDLERS = {
 └──────────┬──────────┘ └─────────────────┘ └─────────────────┘ └─────────────────┘
            │
            ▼
-┌─────────────────────┐
-│ HTTP11Downloader    │
-│                     │
-│  lazy = False       │
-└─────────────────────┘
+┌─────────────────────┐ ┌─────────────────────┐
+│ HTTP11Downloader    │ │ HttpxDownloader     │
+│                     │ │  (实验性)           │
+│  lazy = False       │ │                     │
+│  检查 TWISTED_      │ │  lazy = False       │
+│  REACTOR_ENABLED    │ │  不检查 TWISTED_   │
+│                     │ │  REACTOR_ENABLED    │
+└─────────────────────┘ └─────────────────────┘
 
 其他直接继承 BaseDownloadHandler 的处理器：
 ┌─────────────────────┐ ┌─────────────────────┐
 │ DataURIDownloader   │ │ FileDownloader      │
 │                     │ │                     │
 │  lazy = False       │ │  lazy = False       │
+│  不依赖 Twisted     │ │  不依赖 Twisted     │
 └─────────────────────┘ └─────────────────────┘
 ```
 
-### 3.2 各基类职责分析
+### 4.2 各基类职责分析
 
-#### 3.2.1 `BaseDownloadHandler` - 最底层抽象基类
+#### 4.2.1 `BaseDownloadHandler` - 最底层抽象基类
 
 **文件位置**：`scrapy/core/downloader/handlers/base.py`
 
@@ -166,7 +370,7 @@ class DownloadHandlerProtocol(Protocol):
     async def close(self) -> None: ...
 ```
 
-#### 3.2.2 `BaseHttpDownloadHandler` - HTTP 特定中间基类
+#### 4.2.2 `BaseHttpDownloadHandler` - HTTP 特定中间基类
 
 **文件位置**：`scrapy/utils/_download_handlers.py`
 
@@ -196,24 +400,25 @@ class BaseHttpDownloadHandler(BaseDownloadHandler, ABC):
   - `_tls_verbose_logging` - TLS 详细日志
 - 标记为抽象类（ABC），不能直接实例化
 
-### 3.3 各处理器继承关系汇总表
+### 4.3 各处理器继承关系汇总表
 
-| 处理器 | 直接父类 | 间接父类 | lazy 值 | 使用 HTTP 特定配置 |
-|--------|----------|----------|---------|-------------------|
-| `HTTP11DownloadHandler` | `BaseHttpDownloadHandler` | `BaseDownloadHandler` | `False` | ✅ 是 |
-| `H2DownloadHandler` | `BaseDownloadHandler` | 无 | `True` | ❌ 否（独立实现） |
-| `FTPDownloadHandler` | `BaseDownloadHandler` | 无 | `False` | ❌ 否 |
-| `S3DownloadHandler` | `BaseDownloadHandler` | 无 | `True` | ❌ 否 |
-| `DataURIDownloadHandler` | `BaseDownloadHandler` | 无 | `False` | ❌ 否 |
-| `FileDownloadHandler` | `BaseDownloadHandler` | 无 | `False` | ❌ 否 |
+| 处理器 | 直接父类 | 间接父类 | lazy 值 | 检查 TWISTED_REACTOR_ENABLED | 使用 HTTP 特定配置 |
+|--------|----------|----------|---------|------------------------------|-------------------|
+| `HTTP11DownloadHandler` | `BaseHttpDownloadHandler` | `BaseDownloadHandler` | `False` | ✅ 是 | ✅ 是 |
+| `H2DownloadHandler` | `BaseDownloadHandler` | 无 | `True` | ✅ 是 | ❌ 否（独立实现） |
+| `HttpxDownloadHandler` | `BaseHttpDownloadHandler` | `BaseDownloadHandler` | `False` | ❌ 否（检查 `is_asyncio_available()`） | ✅ 是 |
+| `FTPDownloadHandler` | `BaseDownloadHandler` | 无 | `False` | ✅ 是 | ❌ 否 |
+| `S3DownloadHandler` | `BaseDownloadHandler` | 无 | `True` | ❌ 否 | ❌ 否 |
+| `DataURIDownloadHandler` | `BaseDownloadHandler` | 无 | `False` | ❌ 否 | ❌ 否 |
+| `FileDownloadHandler` | `BaseDownloadHandler` | 无 | `False` | ❌ 否 | ❌ 否 |
 
-### 3.4 关键修正：H2DownloadHandler 的特殊设计
+### 4.4 关键修正：H2DownloadHandler 的特殊设计
 
 **之前的错误描述**：`H2DownloadHandler` 继承 `BaseHttpDownloadHandler`
 
 **正确事实**：`H2DownloadHandler` 直接继承 `BaseDownloadHandler`，**不继承** `BaseHttpDownloadHandler`
 
-#### 3.4.1 代码证据
+#### 4.4.1 代码证据
 
 ```python
 # scrapy/core/downloader/handlers/http2.py:31
@@ -245,55 +450,643 @@ class HTTP11DownloadHandler(BaseHttpDownloadHandler):  # 继承 BaseHttpDownload
         # 可以使用 self._default_maxsize, self._default_warnsize 等
 ```
 
-#### 3.4.2 H2DownloadHandler 为何不继承 BaseHttpDownloadHandler？
+对比 `HttpxDownloadHandler`（用于非 Twisted 模式）：
 
-**设计原因分析**：
+```python
+# scrapy/core/downloader/handlers/_httpx.py:75
+class HttpxDownloadHandler(BaseHttpDownloadHandler):  # 继承 BaseHttpDownloadHandler
+    _DEFAULT_CONNECT_TIMEOUT = 10
 
-1. **HTTP/2 的 maxsize 处理机制不同**：
-   - HTTP/1.1：在 `ScrapyAgent` 和 `_ResponseReader` 中处理，使用继承的 `_default_maxsize`
-   - HTTP/2：在 `Stream` 类中独立处理，从请求 meta 或 spider 属性获取
-
-   ```python
-   # scrapy/core/http2/stream.py:97-120
-   class Stream:
-       def __init__(self, stream_id: int, request: Request, protocol: H2ClientProtocol, ...):
-           # 从请求 meta 获取，不是从 handler 继承
-           self._download_maxsize = self._request.meta.get(
-               "download_maxsize", download_maxsize
-           )
-           self._download_warnsize = self._request.meta.get(
-               "download_warnsize", download_warnsize
-           )
-   ```
-
-2. **HTTP/2 不支持所有 HTTP/1.1 的特性**：
-   - 不支持 `bytes_received` 和 `headers_received` 信号
-   - 不支持 `stop_download` 机制（`BaseHttpDownloadHandler` 相关的 `check_stop_download`）
-
-3. **HTTP/2 是实验性功能**：
-   - 文档标记为 "experimental"
-   - 单独的模块结构（`scrapy/core/http2/`）
-   - 需要手动配置启用
-
-#### 3.4.3 H2DownloadHandler 的职责定位
-
-| 职责 | 实现方式 |
-|------|----------|
-| **协议分发兼容** | 实现 `DownloadHandlerProtocol`，可被 `DownloadHandlers` 路由 |
-| **连接管理** | 拥有独立的 `H2ConnectionPool`，支持多路复用 |
-| **TLS 配置** | 通过 `_load_context_factory_from_settings` 加载，强制 ALPN 协商 `h2` |
-| **超时处理** | 在 `ScrapyH2Agent` 中独立实现（`download_request` 中的 `callLater`） |
-| **大小限制** | 在 `Stream` 类中独立实现，不从 `BaseHttpDownloadHandler` 继承 |
+    def __init__(self, crawler: Crawler):
+        # 不检查 TWISTED_REACTOR_ENABLED，而是检查 is_asyncio_available()
+        if not is_asyncio_available():
+            raise NotConfigured(
+                f"{type(self).__name__} requires the asyncio support. Make"
+                f" sure that you have either enabled the asyncio Twisted"
+                f" reactor in the TWISTED_REACTOR setting or disabled the"
+                f" TWISTED_REACTOR_ENABLED setting."
+            )
+        if httpx is None:
+            raise NotConfigured(
+                f"{type(self).__name__} requires the httpx library to be installed."
+            )
+        super().__init__(crawler)  # 调用 BaseHttpDownloadHandler.__init__
+        # 可以使用 self._default_maxsize, self._default_warnsize 等
+```
 
 ---
 
-## 4. 协议路由机制（复核版）
+## 5. TLS 协商时的对象层级与上下文工厂构建链路（深度挖掘版）
 
-### 4.1 核心实现
+### 5.1 上下文工厂体系结构
+
+Scrapy 的 TLS 上下文工厂采用**包装器模式**（Wrapper Pattern），支持多层包装。
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    IPolicyForHTTPS (接口)                        │
+│  twisted/web/iweb.py                                              │
+│                                                                   │
+│  方法:                                                            │
+│  - creatorForNetloc(hostname: bytes, port: int) → ClientTLSOptions │
+└───────────────────────────┬─────────────────────────────────────┘
+                            │
+            ┌───────────────┼───────────────┐
+            │               │               │
+            ▼               ▼               ▼
+┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐
+│ BrowserLikePolicy │ │ _ScrapyClient   │ │ _Acceptable     │
+│ ForHTTPS (Twisted)│ │ ContextFactory  │ │ ProtocolsContext │
+│                   │ │                 │ │ Factory         │
+│ (默认安全策略)     │ │ (Scrapy 扩展)   │ │ (包装器)         │
+└─────────────────┘ └────────┬────────┘ └────────┬────────┘
+                             │                    │
+                             └─────────┬──────────┘
+                                       │
+                                       ▼
+                              ┌─────────────────┐
+                              │ 包装关系:        │
+                              │                 │
+                              │ _Acceptable     │
+                              │ ProtocolsContext │
+                              │ Factory         │
+                              │     │           │
+                              │     │ 包装器    │
+                              │     ▼           │
+                              │ _ScrapyClient   │
+                              │ ContextFactory  │
+                              │     │           │
+                              │     │ 继承      │
+                              │     ▼           │
+                              │ BrowserLikePolicy │
+                              │ ForHTTPS        │
+                              └─────────────────┘
+```
+
+### 5.2 HTTP/1.1 处理器的上下文工厂构建链路
+
+#### 5.2.1 构建流程
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  HTTP11DownloadHandler.__init__(crawler)                     │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│  1. _load_context_factory_from_settings(crawler)             │
+│                                                              │
+│     scrapy/core/downloader/contextfactory.py:228           │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│  2. 检查 DOWNLOADER_CLIENTCONTEXTFACTORY 设置                │
+│                                                              │
+│     if settings["DOWNLOADER_CLIENTCONTEXTFACTORY"] == "SENTINEL": │
+│         context_factory_cls = _ScrapyClientContextFactory   │
+│     else:                                                     │
+│         context_factory_cls = load_object(...)  # 用户自定义 │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│  3. build_from_crawler(context_factory_cls, crawler)         │
+│                                                              │
+│     → 调用 _ScrapyClientContextFactory.from_crawler(crawler) │
+│     → 创建 _ScrapyClientContextFactory 实例                  │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│  4. 返回 _ScrapyClientContextFactory 实例                    │
+│                                                              │
+│     HTTP11DownloadHandler 直接使用这个实例                   │
+│     没有额外的包装器层                                       │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### 5.2.2 实际使用时的调用链
+
+当建立 TLS 连接时：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Twisted Agent 需要建立 TLS 连接                              │
+│  目标: https://example.com:443                               │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│  1. 调用 context_factory.creatorForNetloc(b"example.com", 443) │
+│                                                              │
+│     这里的 context_factory 是 _ScrapyClientContextFactory   │
+│     (没有被包装)                                             │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│  2. _ScrapyClientContextFactory.creatorForNetloc()          │
+│                                                              │
+│     if not self._verify_certificates:                        │
+│         # 返回 _ScrapyClientTLSOptions（跳过证书验证）       │
+│         return _ScrapyClientTLSOptions(...)                 │
+│     else:                                                    │
+│         # 使用 Twisted 的 optionsForClientTLS               │
+│         return optionsForClientTLS(...)                     │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│  3. 返回 ClientTLSOptions 实例                               │
+│                                                              │
+│     Twisted 使用这个实例中的 SSL 上下文建立 TLS 连接         │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 5.3 HTTP/2 处理器的上下文工厂构建链路（关键修正）
+
+**关键发现**：HTTP/2 的上下文工厂有**两层**：
+1. 基础层：`_ScrapyClientContextFactory`（从设置加载）
+2. 包装层：`_AcceptableProtocolsContextFactory`（强制设置 ALPN 协议）
+
+#### 5.3.1 构建流程图
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  H2DownloadHandler.__init__(crawler)                        │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│  1. _load_context_factory_from_settings(crawler)             │
+│                                                              │
+│     → 返回 _ScrapyClientContextFactory 实例                 │
+│     (这一步与 HTTP/1.1 相同)                                 │
+│                                                              │
+│     self._context_factory = 这个实例                        │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│  2. 后续在 H2Agent 中进行包装                                │
+│                                                              │
+│     注意：包装不是在 H2DownloadHandler 中完成的，            │
+│           而是在 ScrapyH2Agent 内部的 H2Agent 中完成的     │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│  3. H2Agent.__init__() 中的包装                             │
+│                                                              │
+│     scrapy/core/http2/agent.py                              │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│  4. 使用 _AcceptableProtocolsContextFactory 进行包装         │
+│                                                              │
+│     self._context_factory = _AcceptableProtocolsContextFactory( │
+│         context_factory,           # 被包装的对象：_ScrapyClientContextFactory │
+│         acceptable_protocols=[b"h2"]  # 强制协商的协议     │
+│     )                                                        │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│  5. 最终的上下文工厂结构                                      │
+│                                                              │
+│     _AcceptableProtocolsContextFactory (包装器)              │
+│         │                                                    │
+│         └── _wrapped_context_factory: _ScrapyClientContextFactory │
+│                                                              │
+│     同时：                                                    │
+│     self._acceptable_protocols = [b"h2"]                   │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### 5.3.2 实际使用时的调用链
+
+当建立 TLS 连接时，HTTP/2 的调用链与 HTTP/1.1 有本质区别：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  H2ConnectionPool 需要建立 TLS 连接                          │
+│  目标: https://example.com:443 (HTTP/2)                     │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│  1. 调用 context_factory.creatorForNetloc(b"example.com", 443) │
+│                                                              │
+│     这里的 context_factory 是 _AcceptableProtocolsContextFactory │
+│     (是包装器，不是原始的 _ScrapyClientContextFactory)       │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│  2. _AcceptableProtocolsContextFactory.creatorForNetloc()   │
+│                                                              │
+│     scrapy/core/downloader/contextfactory.py:212            │
+│                                                              │
+│     def creatorForNetloc(self, hostname, port):            │
+│         # 第一步：调用被包装的上下文工厂                     │
+│         options = self._wrapped_context_factory.creatorForNetloc(
+│             hostname, port
+│         )                                                    │
+│                                                              │
+│         # 第二步：强制设置 ALPN 协议                         │
+│         # _setAcceptableProtocols 来自 twisted.internet._sslverify │
+│         _setAcceptableProtocols(options._ctx, self._acceptable_protocols)
+│                                                              │
+│         # 第三步：返回修改后的 options                        │
+│         return options                                       │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│  3. 内部调用 _ScrapyClientContextFactory.creatorForNetloc()  │
+│                                                              │
+│     → 返回 ClientTLSOptions 实例                             │
+│     → 这个实例包含了基本的 SSL 上下文                        │
+│     → 但还没有设置 ALPN 协议                                 │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│  4. 调用 _setAcceptableProtocols(options._ctx, [b"h2"])     │
+│                                                              │
+│     这个函数会：                                              │
+│     - 设置 SSL 上下文的 ALPN 协议列表                        │
+│     - 设置 NPN 协议列表（向后兼容）                           │
+│                                                              │
+│     结果：SSL 上下文现在只能协商 "h2" 协议                   │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│  5. 返回修改后的 ClientTLSOptions 实例                       │
+│                                                              │
+│     Twisted 使用这个实例建立 TLS 连接                        │
+│     TLS 握手时会使用 ALPN 协商 "h2" 协议                     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 5.4 _setAcceptableProtocols 函数作用
+
+这个函数来自 Twisted，用于设置 ALPN/NPN 协议：
+
+```python
+# 伪代码逻辑
+def _setAcceptableProtocols(ctx, acceptable_protocols):
+    """设置 SSL 上下文的 ALPN 和 NPN 协议列表"""
+    
+    # 设置 ALPN 协议（现代 TLS 握手使用）
+    ctx.set_alpn_protocols(acceptable_protocols)  # e.g., [b"h2"]
+    
+    # 设置 NPN 协议（向后兼容，用于旧版 TLS）
+    ctx.set_npn_protocols(acceptable_protocols)
+```
+
+### 5.5 HTTP/1.1 vs HTTP/2 上下文工厂对比
+
+| 特性 | HTTP/1.1 | HTTP/2 |
+|------|----------|--------|
+| 基础上下文工厂 | `_ScrapyClientContextFactory` | `_ScrapyClientContextFactory` |
+| 包装层 | ❌ 无 | ✅ `_AcceptableProtocolsContextFactory` |
+| ALPN 协议设置 | 未强制设置（使用默认） | 强制设置为 `[b"h2"]` |
+| 协商结果 | 可以协商 http/1.1 或其他 | 只能协商 h2 |
+| 协议验证 | 无 | TLS 握手后验证 `negotiatedProtocol == b"h2"` |
+
+### 5.6 TLS 协商完整对象层级图
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                      HTTP/2 TLS 协商对象层级                         │
+└───────────────────────────────────┬─────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  H2Agent                                                            │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │ self._context_factory = _AcceptableProtocolsContextFactory( │   │
+│  │     context_factory=_ScrapyClientContextFactory(...),       │   │
+│  │     acceptable_protocols=[b"h2"]                            │   │
+│  │ )                                                             │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+└───────────────────────────────────┬─────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  _AcceptableProtocolsContextFactory (包装器)                         │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │ 属性:                                                         │   │
+│  │   - _wrapped_context_factory: _ScrapyClientContextFactory   │   │
+│  │   - _acceptable_protocols: [b"h2"]                          │   │
+│  │                                                               │   │
+│  │ 方法:                                                         │   │
+│  │   - creatorForNetloc(hostname, port):                       │   │
+│  │       1. options = self._wrapped_context_factory.creatorForNetloc(...) │
+│  │       2. _setAcceptableProtocols(options._ctx, [b"h2"])    │   │
+│  │       3. return options                                      │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+└───────────────────────────────────┬─────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  _ScrapyClientContextFactory (被包装的实际实现)                      │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │ 属性:                                                         │   │
+│  │   - _ssl_method: int (TLS 方法)                              │   │
+│  │   - tls_verbose_logging: bool                                │   │
+│  │   - tls_ciphers: AcceptableCiphers                           │   │
+│  │   - _verify_certificates: bool                               │   │
+│  │                                                               │   │
+│  │ 方法:                                                         │   │
+│  │   - creatorForNetloc(hostname, port):                       │   │
+│  │       → 返回 ClientTLSOptions 实例                           │   │
+│  │       → 包含基本的 SSL 上下文配置                            │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+└───────────────────────────────────┬─────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  TLS 握手时的实际调用                                                 │
+│                                                                       │
+│  1. H2Agent 需要建立连接                                             │
+│  2. 调用 self._context_factory.creatorForNetloc(b"example.com", 443) │
+│  3. 这实际上是 _AcceptableProtocolsContextFactory.creatorForNetloc() │
+│  4. 内部调用 _wrapped_context_factory.creatorForNetloc()            │
+│  5. 得到 ClientTLSOptions 实例，其 _ctx 包含基本 SSL 配置           │
+│  6. 调用 _setAcceptableProtocols(options._ctx, [b"h2"])            │
+│  7. options._ctx 现在强制设置了 ALPN 协议为 [b"h2"]                 │
+│  8. Twisted 使用这个 options 建立 TLS 连接                           │
+│  9. TLS 握手时，ALPN 协议协商只能是 "h2"                             │
+│ 10. 如果服务器不支持 h2，协商会失败，连接会被关闭                    │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 5.7 HTTP/2 协议验证（握手后）
+
+即使 ALPN 协商成功，HTTP/2 处理器还会在 TLS 握手完成后进行额外验证：
+
+```python
+# scrapy/core/http2/protocol.py
+
+class H2ClientProtocol(Protocol, TimeoutMixin):
+    # ...
+    
+    def handshakeCompleted(self) -> None:
+        """TLS 握手完成后的回调"""
+        assert self.transport is not None
+        
+        # 验证协商的协议是否为 h2
+        if (
+            self.transport.negotiatedProtocol is not None
+            and self.transport.negotiatedProtocol != PROTOCOL_NAME  # PROTOCOL_NAME = b"h2"
+        ):
+            # 协议不匹配，关闭连接
+            self._lose_connection_with_error(
+                [InvalidNegotiatedProtocol(self.transport.negotiatedProtocol)]
+            )
+```
+
+**这意味着**：
+1. 即使 ALPN 协商设置正确
+2. 如果服务器实际协商的不是 `h2`（而是 `http/1.1`）
+3. 连接会被立即关闭
+4. 抛出 `InvalidNegotiatedProtocol` 异常
+
+---
+
+## 6. 非 Twisted 运行模式下的默认协议分发行为变化（新增深度分析）
+
+### 6.1 TWISTED_REACTOR_ENABLED 概述
+
+**默认值**：`TWISTED_REACTOR_ENABLED = True`（`scrapy/settings/default_settings.py:531`）
+
+**设置为 `False` 时**：Scrapy 不使用 Twisted reactor，而是使用纯 asyncio 事件循环
+
+### 6.2 各处理器对 TWISTED_REACTOR_ENABLED 的检查
+
+| 处理器 | 检查方式 | 非 Twisted 模式下行为 |
+|--------|----------|---------------------|
+| `HTTP11DownloadHandler` | `getbool("TWISTED_REACTOR_ENABLED")` | 抛出 `NotConfigured` |
+| `H2DownloadHandler` | `getbool("TWISTED_REACTOR_ENABLED")` | 抛出 `NotConfigured` |
+| `FTPDownloadHandler` | `getbool("TWISTED_REACTOR_ENABLED")` | 抛出 `NotConfigured` |
+| `HttpxDownloadHandler` | `is_asyncio_available()` | 如果有 asyncio 循环则正常工作 |
+| `S3DownloadHandler` | 不检查（但需要 HTTP 处理器） | 依赖的 HTTP 处理器不可用 |
+| `DataURIDownloadHandler` | 不检查 | 正常工作 |
+| `FileDownloadHandler` | 不检查 | 正常工作 |
+
+### 6.3 处理器检查代码证据
+
+#### 6.3.1 HTTP11DownloadHandler
+
+```python
+# scrapy/core/downloader/handlers/http11.py:85
+class HTTP11DownloadHandler(BaseHttpDownloadHandler):
+    def __init__(self, crawler: Crawler):
+        if not crawler.settings.getbool("TWISTED_REACTOR_ENABLED"):
+            raise NotConfigured(f"{type(self).__name__} requires a Twisted reactor.")
+        super().__init__(crawler)
+        # ...
+```
+
+#### 6.3.2 FTPDownloadHandler
+
+```python
+# scrapy/core/downloader/handlers/ftp.py:88
+class FTPDownloadHandler(BaseDownloadHandler):
+    def __init__(self, crawler: Crawler):
+        if not crawler.settings.getbool("TWISTED_REACTOR_ENABLED"):
+            raise NotConfigured(f"{type(self).__name__} requires a Twisted reactor.")
+        super().__init__(crawler)
+        # ...
+```
+
+#### 6.3.3 HttpxDownloadHandler（特殊）
+
+```python
+# scrapy/core/downloader/handlers/_httpx.py:80
+class HttpxDownloadHandler(BaseHttpDownloadHandler):
+    def __init__(self, crawler: Crawler):
+        # 不检查 TWISTED_REACTOR_ENABLED
+        # 而是检查 is_asyncio_available()
+        if not is_asyncio_available():
+            raise NotConfigured(
+                f"{type(self).__name__} requires the asyncio support. Make"
+                f" sure that you have either enabled the asyncio Twisted"
+                f" reactor in the TWISTED_REACTOR setting or disabled the"
+                f" TWISTED_REACTOR_ENABLED setting."
+            )
+        if httpx is None:
+            raise NotConfigured(
+                f"{type(self).__name__} requires the httpx library to be installed."
+            )
+        super().__init__(crawler)
+        # ...
+```
+
+#### 6.3.4 DataURIDownloadHandler（无检查）
+
+```python
+# scrapy/core/downloader/handlers/datauri.py:15
+class DataURIDownloadHandler(BaseDownloadHandler):
+    async def download_request(self, request: Request) -> Response:
+        # 没有任何 TWISTED_REACTOR_ENABLED 检查
+        # 直接解析 data: URI
+        uri = parse_data_uri(request.url)
+        # ...
+```
+
+### 6.4 非 Twisted 模式下的默认处理器状态
+
+**默认配置下**（`TWISTED_REACTOR_ENABLED = False` 且用户未配置 `DOWNLOAD_HANDLERS`）：
+
+| 协议 | 默认处理器 | 非 Twisted 模式下状态 |
+|------|-----------|---------------------|
+| `http` | `HTTP11DownloadHandler` | ❌ 不可用（抛出 `NotConfigured`） |
+| `https` | `HTTP11DownloadHandler` | ❌ 不可用（抛出 `NotConfigured`） |
+| `ftp` | `FTPDownloadHandler` | ❌ 不可用（抛出 `NotConfigured`） |
+| `s3` | `S3DownloadHandler` | ❌ 不可用（依赖的 HTTPS 处理器不可用） |
+| `data` | `DataURIDownloadHandler` | ✅ 正常工作 |
+| `file` | `FileDownloadHandler` | ✅ 正常工作 |
+
+### 6.5 非 Twisted 模式下的请求处理流程
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  请求: "http://example.com/page"                             │
+│  模式: TWISTED_REACTOR_ENABLED = False                       │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│  1. DownloadHandlers.download_request_async()               │
+│     → scheme = "http"                                       │
+│     → _get_handler("http")                                  │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│  2. _get_handler("http")                                     │
+│     → "http" in self._schemes? → Yes                        │
+│     → "http" in self._handlers? → No (首次请求)            │
+│     → 调用 _load_handler("http", skip_lazy=False)          │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│  3. _load_handler("http")                                    │
+│     → dhcls = HTTP11DownloadHandler                         │
+│     → dh = build_from_crawler(dhcls, crawler)              │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│  4. HTTP11DownloadHandler.__init__(crawler)                 │
+│     → if not crawler.settings.getbool("TWISTED_REACTOR_ENABLED"): │
+│         raise NotConfigured("HTTP11DownloadHandler requires a Twisted reactor.") │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│  5. _load_handler 捕获 NotConfigured 异常                    │
+│     → self._notconfigured["http"] = "HTTP11DownloadHandler requires a Twisted reactor." │
+│     → return None                                           │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│  6. _get_handler 返回 None                                   │
+│     → 抛出 NotSupported: "Unsupported URL scheme 'http': HTTP11DownloadHandler requires a Twisted reactor." │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 6.6 非 Twisted 模式下使用 HTTP 的配置方式
+
+**用户必须手动配置 `HttpxDownloadHandler`** 才能在非 Twisted 模式下使用 HTTP/HTTPS：
+
+```python
+# settings.py
+TWISTED_REACTOR_ENABLED = False
+
+DOWNLOAD_HANDLERS = {
+    "http": "scrapy.core.downloader.handlers._httpx.HttpxDownloadHandler",
+    "https": "scrapy.core.downloader.handlers._httpx.HttpxDownloadHandler",
+}
+```
+
+### 6.7 HttpxDownloadHandler 与其他处理器的对比
+
+| 特性 | HTTP11DownloadHandler | HttpxDownloadHandler |
+|------|----------------------|---------------------|
+| 继承关系 | `BaseHttpDownloadHandler` | `BaseHttpDownloadHandler` |
+| 依赖网络库 | Twisted | httpx |
+| 检查 TWISTED_REACTOR_ENABLED | ✅ 是 | ❌ 否 |
+| 检查 is_asyncio_available | ❌ 否 | ✅ 是 |
+| 支持代理 | ✅ 完整 | ❌ 不支持请求级别代理 |
+| 支持绑定地址 | ✅ 完整 | ⚠️ 仅支持主机，不支持端口 |
+| 支持信号 | ✅ `bytes_received`, `headers_received` | ✅ `bytes_received`, `headers_received` |
+| 文档状态 | 稳定 | 实验性 |
+
+### 6.8 非 Twisted 模式测试用例证据
+
+```python
+# tests/AsyncCrawlerRunner/reactorless_datauri.py
+# 这是一个非 Twisted 模式下的测试
+
+import asyncio
+
+from scrapy import Request, Spider
+from scrapy.crawler import AsyncCrawlerRunner
+from scrapy.utils.log import configure_logging
+
+
+class DataSpider(Spider):
+    name = "data"
+
+    async def start(self):
+        yield Request("data:,foo")  # 只有 data: URI 可以正常工作
+
+    def parse(self, response):
+        return {"data": response.text}
+
+
+async def main() -> None:
+    configure_logging()
+    runner = AsyncCrawlerRunner(settings={"TWISTED_REACTOR_ENABLED": False})
+    await runner.crawl(DataSpider)
+
+
+asyncio.run(main())
+```
+
+**测试用例说明**：
+- 只测试 `data:` URI 协议
+- 不测试 `http://` 或 `https://` 协议
+- 这说明默认配置下非 Twisted 模式无法使用 HTTP
+
+### 6.9 非 Twisted 模式关键事实汇总
+
+| 事实 | 说明 |
+|------|------|
+| 默认 HTTP 处理器不可用 | `HTTP11DownloadHandler` 检查 `TWISTED_REACTOR_ENABLED`，为 `False` 时抛出 `NotConfigured` |
+| 必须手动配置 `HttpxDownloadHandler` | 这是目前非 Twisted 模式下使用 HTTP 的唯一方式 |
+| `DataURIDownloadHandler` 和 `FileDownloadHandler` 正常工作 | 它们不依赖 Twisted |
+| `HttpxDownloadHandler` 继承 `BaseHttpDownloadHandler` | 可以使用 `_default_maxsize` 等属性，支持信号 |
+| `HttpxDownloadHandler` 是实验性的 | 文档标记为 "not recommended for production" |
+
+---
+
+## 7. 协议路由机制（复核版）
+
+### 7.1 核心实现
 
 `DownloadHandlers` 类位于 `scrapy/core/downloader/handlers/__init__.py`，是整个分发机制的核心。
 
-#### 4.1.1 数据结构
+#### 7.1.1 数据结构
 
 ```python
 class DownloadHandlers:
@@ -313,11 +1106,12 @@ class DownloadHandlers:
         self._old_style_handlers: set[str] = set()
 ```
 
-#### 4.1.2 初始化流程
+#### 7.1.2 初始化流程
 
 ```python
 def __init__(self, crawler: Crawler):
     # 1. 合并配置：DOWNLOAD_HANDLERS + DOWNLOAD_HANDLERS_BASE
+    # 2. 过滤值为 None 的协议（禁用的协议）
     handlers: dict[str, str | Callable[..., Any]] = without_none_values(
         cast(
             "dict[str, str | Callable[..., Any]]",
@@ -325,17 +1119,17 @@ def __init__(self, crawler: Crawler):
         )
     )
     
-    # 2. 遍历所有协议，注册到 _schemes
+    # 3. 遍历所有协议，注册到 _schemes
     for scheme, clspath in handlers.items():
         self._schemes[scheme] = clspath
-        # 3. 尝试预加载（非惰性处理器会被实例化）
+        # 4. 尝试预加载（非惰性处理器会被实例化）
         self._load_handler(scheme, skip_lazy=True)
     
-    # 4. 注册关闭信号
+    # 5. 注册关闭信号
     crawler.signals.connect(self._close, signals.engine_stopped)
 ```
 
-#### 4.1.3 请求路由流程
+#### 7.1.3 请求路由流程
 
 ```python
 async def download_request_async(self, request: Request) -> Response:
@@ -367,101 +1161,88 @@ async def download_request_async(self, request: Request) -> Response:
     return await handler.download_request(request)
 ```
 
-### 4.2 路由流程图
-
-```
-请求 URL: "https://example.com/page"
-           │
-           ▼
-┌─────────────────────────────────────────────────────────────┐
-│  urlparse_cached(request).scheme                             │
-│  结果: "https"                                                │
-└───────────────────────────┬─────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────┐
-│  _get_handler("https")                                       │
-│  ┌─────────────────────────────────────────────────────┐    │
-│  │ 1. 检查 self._handlers 中是否已有缓存               │    │
-│  │    if "https" in self._handlers: return it         │    │
-│  │                                                      │    │
-│  │ 2. 检查是否配置失败                                   │    │
-│  │    if "https" in self._notconfigured: return None  │    │
-│  │                                                      │    │
-│  │ 3. 检查是否支持该协议                                 │    │
-│  │    if "https" not in self._schemes:                 │    │
-│  │        self._notconfigured["https"] = "no handler"  │    │
-│  │        return None                                   │    │
-│  │                                                      │    │
-│  │ 4. 惰性加载处理器                                     │    │
-│  │    return self._load_handler("https")               │    │
-│  └─────────────────────────────────────────────────────┘    │
-└───────────────────────────┬─────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────┐
-│  处理器实例: HTTP11DownloadHandler 或 H2DownloadHandler      │
-│  (取决于用户配置的 DOWNLOAD_HANDLERS)                        │
-└───────────────────────────┬─────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────┐
-│  handler.download_request(request)                           │
-│  执行实际下载                                                 │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### 4.3 配置合并规则
-
-`settings.getwithbase("DOWNLOAD_HANDLERS")` 的合并逻辑：
+### 7.2 _get_handler 完整逻辑
 
 ```python
-# 伪代码逻辑
-def getwithbase(key):
-    base_value = getattr(self, key + "_BASE", {})
-    user_value = getattr(self, key, {})
+def _get_handler(self, scheme: str) -> DownloadHandlerProtocol | None:
+    """Lazy-load the downloadhandler for a scheme
+    only on the first request for that scheme.
+    """
+    # 1. 检查是否已缓存实例
+    if scheme in self._handlers:
+        return self._handlers[scheme]
     
-    # 合并：用户配置覆盖默认配置
-    result = base_value.copy()
-    result.update(user_value)
+    # 2. 检查是否配置失败
+    if scheme in self._notconfigured:
+        return None
     
-    # 过滤掉值为 None 的项（表示禁用）
-    return {k: v for k, v in result.items() if v is not None}
+    # 3. 检查是否支持该协议（是否已注册到 self._schemes）
+    if scheme not in self._schemes:
+        # 如果没有注册，记录到 _notconfigured
+        self._notconfigured[scheme] = "no handler available for that scheme"
+        return None
+    
+    # 4. 尝试加载（实例化）处理器
+    return self._load_handler(scheme)
 ```
 
-**示例**：
+### 7.3 协议分发完整流程图
 
-```python
-# 默认配置 (DOWNLOAD_HANDLERS_BASE)
-{
-    "http": "HTTP11DownloadHandler",
-    "https": "HTTP11DownloadHandler",
-    "ftp": "FTPDownloadHandler",
-    ...
-}
-
-# 用户配置 (DOWNLOAD_HANDLERS)
-{
-    "https": "H2DownloadHandler",  # 覆盖默认
-    "ftp": None,                     # 禁用
-    "sftp": "MySftpHandler"          # 新增
-}
-
-# 合并结果
-{
-    "http": "HTTP11DownloadHandler",   # 保留默认
-    "https": "H2DownloadHandler",      # 用户覆盖
-    # "ftp" 被移除（值为 None）
-    "sftp": "MySftpHandler",           # 用户新增
-    ...
-}
+```
+┌─────────────────────────────────────────────────────────────┐
+│  请求: "https://example.com/page"                            │
+│  模式: TWISTED_REACTOR_ENABLED = True                        │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│  1. urlparse_cached(request).scheme                          │
+│     → "https"                                                │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│  2. _get_handler("https")                                    │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+            ┌───────────────┼───────────────┐
+            │               │               │
+            ▼               ▼               ▼
+┌───────────────┐ ┌───────────────┐ ┌───────────────┐
+│ 已缓存?       │ │ 配置失败?     │ │ 已注册?       │
+│               │ │               │ │               │
+│ "https" in    │ │ "https" in    │ │ "https" in    │
+│ self._handlers│ │ self._notconfig│ │ self._schemes │
+└───────┬───────┘ └───────┬───────┘ └───────┬───────┘
+        │                 │                 │
+        ▼                 ▼                 ▼
+     返回实例          返回 None         继续检查
+                                            │
+                                            ▼
+                                    ┌───────────────┐
+                                    │ 调用          │
+                                    │ _load_handler │
+                                    └───────┬───────┘
+                                            │
+                                            ▼
+                                    ┌───────────────┐
+                                    │ 实例化处理器   │
+                                    │ 检查依赖      │
+                                    │ 缓存到        │
+                                    │ self._handlers│
+                                    └───────┬───────┘
+                                            │
+                                            ▼
+                                    ┌───────────────┐
+                                    │ 返回处理器实例 │
+                                    └───────────────┘
 ```
 
 ---
 
-## 5. 惰性加载机制（复核版）
+## 8. 惰性加载机制（复核版）
 
-### 5.1 设计目的
+### 8.1 设计目的
 
 惰性加载（Lazy Loading）的设计目的：
 
@@ -469,9 +1250,9 @@ def getwithbase(key):
 2. **节省资源**：对于不使用的协议（如 S3），不会加载其依赖
 3. **错误隔离**：某个处理器初始化失败不影响其他处理器
 
-### 5.2 实现机制
+### 8.2 实现机制
 
-#### 5.2.1 `lazy` 属性
+#### 8.2.1 `lazy` 属性
 
 每个处理器通过 `lazy` 类属性声明是否惰性加载：
 
@@ -492,7 +1273,7 @@ class BaseDownloadHandler(ABC):
     lazy: bool = False  # 默认非惰性
 ```
 
-#### 5.2.2 `_load_handler` 方法核心逻辑
+#### 8.2.2 `_load_handler` 方法核心逻辑
 
 ```python
 def _load_handler(
@@ -542,7 +1323,7 @@ def _load_handler(
     return dh
 ```
 
-### 5.3 加载时序图
+### 8.3 加载时序图
 
 ```
 Scrapy 启动阶段
@@ -584,7 +1365,7 @@ Scrapy 启动阶段
                     处理器准备就绪
 ```
 
-### 5.4 惰性加载处理器列表
+### 8.4 惰性加载处理器列表
 
 | 处理器 | lazy 值 | 原因 |
 |--------|----------|------|
@@ -594,8 +1375,9 @@ Scrapy 启动阶段
 | `FTPDownloadHandler` | `False` | 默认协议处理器 |
 | `DataURIDownloadHandler` | `False` | 轻量级，无依赖 |
 | `FileDownloadHandler` | `False` | 轻量级，无依赖 |
+| `HttpxDownloadHandler` | `False` | 未指定，使用默认值 |
 
-### 5.5 S3 处理器的特殊惰性行为
+### 8.5 S3 处理器的特殊惰性行为
 
 `S3DownloadHandler` 不仅在类级别惰性加载，实例化时还会检查依赖：
 
@@ -626,9 +1408,9 @@ class S3DownloadHandler(BaseDownloadHandler):
 
 ---
 
-## 6. HTTP/2 支持集成分析（修正版）
+## 9. HTTP/2 支持集成分析（复核版）
 
-### 6.1 概述
+### 9.1 概述
 
 HTTP/2 支持在 Scrapy 中是**实验性功能**，具有以下特点：
 
@@ -636,8 +1418,9 @@ HTTP/2 支持在 Scrapy 中是**实验性功能**，具有以下特点：
 2. **独立实现**：有自己的连接池、协议、流管理
 3. **仅支持 HTTPS**：不支持明文 HTTP/2 (h2c)
 4. **惰性加载**：`lazy = True`
+5. **强制 ALPN 协商**：通过 `_AcceptableProtocolsContextFactory` 包装器
 
-### 6.2 配置方式
+### 9.2 配置方式
 
 ```python
 # settings.py
@@ -648,7 +1431,7 @@ DOWNLOAD_HANDLERS = {
 
 **重要**：HTTP/2 处理器只支持 `https` 协议，不支持 `http` 协议。
 
-### 6.3 模块架构
+### 9.3 模块架构
 
 ```
 scrapy/core/downloader/handlers/http2.py
@@ -658,7 +1441,7 @@ scrapy/core/downloader/handlers/http2.py
     │   ├── __init__(crawler)
     │   │   ├── 检查 TWISTED_REACTOR_ENABLED
     │   │   ├── 创建 H2ConnectionPool
-    │   │   └── 加载 TLS 上下文工厂
+    │   │   └── 加载 TLS 上下文工厂（基础层）
     │   ├── download_request(request) → Response
     │   └── close() → None
     │
@@ -670,937 +1453,20 @@ scrapy/core/http2/
     │
     ├── agent.py
     │   ├── H2ConnectionPool (连接池)
-    │   │   ├── _connections: dict[ConnectionKeyT, H2ClientProtocol]
-    │   │   ├── _pending_requests: dict[ConnectionKeyT, deque[Deferred]]
-    │   │   ├── get_connection(key, uri, endpoint)
-    │   │   ├── _new_connection(key, uri, endpoint)
-    │   │   └── close_connections()
-    │   │
     │   ├── H2Agent (核心 Agent)
-    │   │   ├── endpoint_factory (用于创建端点)
-    │   │   ├── get_endpoint(uri) → HostnameEndpoint
-    │   │   ├── get_key(uri) → ConnectionKeyT
-    │   │   └── request(request, spider) → Deferred[Response]
-    │   │
+    │   │   ├── 关键：使用 _AcceptableProtocolsContextFactory 包装
+    │   │   │       上下文工厂
+    │   │   └── endpoint_factory
     │   └── ScrapyProxyH2Agent (HTTP 代理支持)
-    │       └── 重写 get_endpoint 和 get_key
     │
     ├── protocol.py
     │   ├── H2ClientProtocol (协议实现)
-    │   │   ├── conn: H2Connection (hyper-h2)
-    │   │   ├── streams: dict[int, Stream]
-    │   │   ├── _pending_request_stream_pool: deque[Stream]
-    │   │   ├── request(request, spider) → Deferred[Response]
-    │   │   ├── dataReceived(data)
-    │   │   └── _handle_events(events)
-    │   │
+    │   │   ├── handshakeCompleted() - 验证协商协议
+    │   │   └── conn: H2Connection (hyper-h2)
     │   └── H2ClientFactory (协议工厂)
-    │       └── acceptableProtocols() → [b"h2"]
     │
     └── stream.py
         └── Stream (单个 HTTP/2 流)
-            ├── stream_id: int
-            ├── _download_maxsize: int
-            ├── _download_warnsize: int
-            ├── initiate_request()
-            ├── send_data()
-            ├── receive_headers(headers)
-            ├── receive_data(data, flow_controlled_length)
-            └── close(reason, errors, from_protocol)
 ```
 
-### 6.4 H2DownloadHandler 详细实现
-
-#### 6.4.1 初始化
-
-```python
-class H2DownloadHandler(BaseDownloadHandler):  # 注意：不是 BaseHttpDownloadHandler
-    lazy = True
-
-    def __init__(self, crawler: Crawler):
-        # 1. 检查 Twisted reactor 是否启用
-        if not crawler.settings.getbool("TWISTED_REACTOR_ENABLED"):
-            raise NotConfigured(f"{type(self).__name__} requires a Twisted reactor.")
-        
-        # 2. 调用父类初始化（只设置 self.crawler）
-        super().__init__(crawler)
-        self._crawler = crawler
-
-        from twisted.internet import reactor
-
-        # 3. 创建 HTTP/2 连接池
-        self._pool = H2ConnectionPool(reactor, crawler.settings)
-        
-        # 4. 加载 TLS 上下文工厂
-        # 注意：这里会强制设置 ALPN 协议为 [b"h2"]
-        self._context_factory = _load_context_factory_from_settings(crawler)
-        
-        # 5. 绑定地址
-        self._bind_address = crawler.settings.get("DOWNLOAD_BIND_ADDRESS")
-```
-
-#### 6.4.2 下载请求处理
-
-```python
-async def download_request(self, request: Request) -> Response:
-    # 创建 ScrapyH2Agent 实例
-    agent = ScrapyH2Agent(
-        context_factory=self._context_factory,
-        pool=self._pool,
-        bind_address=self._bind_address,
-        crawler=self._crawler,
-    )
-    
-    assert self._crawler.spider
-    
-    # 执行下载（使用 wrap_twisted_exceptions 包装异常）
-    with wrap_twisted_exceptions():
-        return await maybe_deferred_to_future(
-            agent.download_request(request, self._crawler.spider)
-        )
-```
-
-### 6.5 ALPN 协议协商
-
-HTTP/2 强制使用 ALPN (Application Layer Protocol Negotiation) 来协商协议。
-
-#### 6.5.1 上下文工厂
-
-```python
-# scrapy/core/downloader/contextfactory.py
-
-class _AcceptableProtocolsContextFactory:
-    """用于强制协商特定协议的上下文工厂包装器"""
-    
-    def __init__(self, context_factory, acceptable_protocols):
-        self._context_factory = context_factory
-        self._acceptable_protocols = acceptable_protocols
-
-    def creatorForNetloc(self, hostname, port):
-        # 获取原始 SSL 上下文
-        context = self._context_factory.creatorForNetloc(hostname, port)
-        
-        # 强制设置 ALPN 协议
-        context.set_alpn_protocols(self._acceptable_protocols)
-        
-        # 强制设置 NPN 协议（向后兼容）
-        context.set_npn_protocols(self._acceptable_protocols)
-        
-        return context
-```
-
-#### 6.5.2 H2Agent 中的应用
-
-```python
-# scrapy/core/http2/agent.py
-
-class H2Agent:
-    def __init__(
-        self,
-        reactor: ReactorBase,
-        pool: H2ConnectionPool,
-        context_factory: BrowserLikePolicyForHTTPS = BrowserLikePolicyForHTTPS(),
-        connect_timeout: float | None = None,
-        bind_address: tuple[str, int] | None = None,
-    ) -> None:
-        self._reactor = reactor
-        self._pool = pool
-        
-        # 关键：包装上下文工厂，强制协商 h2 协议
-        self._context_factory = _AcceptableProtocolsContextFactory(
-            context_factory, acceptable_protocols=[b"h2"]
-        )
-        
-        self.endpoint_factory = _StandardEndpointFactory(
-            self._reactor, self._context_factory, connect_timeout, bind_address
-        )
-```
-
-#### 6.5.3 协议验证
-
-如果服务器不支持 HTTP/2，连接会失败：
-
-```python
-# scrapy/core/http2/protocol.py
-
-class H2ClientProtocol(Protocol, TimeoutMixin):
-    # ...
-    
-    def handshakeCompleted(self) -> None:
-        """TLS 握手完成后验证协商的协议"""
-        assert self.transport is not None
-        
-        # 检查协商的协议是否为 h2
-        if (
-            self.transport.negotiatedProtocol is not None
-            and self.transport.negotiatedProtocol != PROTOCOL_NAME  # PROTOCOL_NAME = b"h2"
-        ):
-            # 协议不匹配，关闭连接
-            self._lose_connection_with_error(
-                [InvalidNegotiatedProtocol(self.transport.negotiatedProtocol)]
-            )
-```
-
-### 6.6 连接池管理
-
-HTTP/2 的连接池与 HTTP/1.1 有本质区别：
-
-| 特性 | HTTP/1.1 | HTTP/2 |
-|------|----------|--------|
-| 连接复用 | 每个请求一个连接（或有限持久连接） | 单连接多路复用 |
-| 并发模型 | 依赖多个 TCP 连接 | 单连接多流 |
-| 连接键 | 主机+端口 | 主机+端口+协议 |
-| 待处理请求 | 无（立即创建新连接） | 有（等待连接建立） |
-
-#### 6.6.1 H2ConnectionPool 实现
-
-```python
-class H2ConnectionPool:
-    def __init__(self, reactor: ReactorBase, settings: Settings):
-        self._reactor = reactor
-        self.settings = settings
-        
-        # 活跃连接：key -> H2ClientProtocol
-        # key = (scheme, host, port)
-        self._connections: dict[ConnectionKeyT, H2ClientProtocol] = {}
-        
-        # 待处理请求：在连接建立前到达的请求
-        self._pending_requests: dict[
-            ConnectionKeyT, deque[Deferred[H2ClientProtocol]]
-        ] = {}
-
-    def get_connection(
-        self, key: ConnectionKeyT, uri: URI, endpoint: HostnameEndpoint
-    ) -> Deferred[H2ClientProtocol]:
-        # 1. 检查是否有正在建立的连接
-        if key in self._pending_requests:
-            # 加入待处理队列
-            d: Deferred[H2ClientProtocol] = Deferred()
-            self._pending_requests[key].append(d)
-            return d
-        
-        # 2. 检查是否已有可用连接
-        conn = self._connections.get(key, None)
-        if conn:
-            return defer.succeed(conn)
-        
-        # 3. 建立新连接
-        return self._new_connection(key, uri, endpoint)
-```
-
-### 6.7 多路复用与流管理
-
-#### 6.7.1 Stream 类
-
-每个 HTTP/2 请求对应一个 `Stream` 对象：
-
-```python
-class Stream:
-    def __init__(
-        self,
-        stream_id: int,
-        request: Request,
-        protocol: H2ClientProtocol,
-        download_maxsize: int = 0,
-        download_warnsize: int = 0,
-    ) -> None:
-        self.stream_id = stream_id  # 奇数，客户端发起
-        self._request = request
-        self._protocol = protocol
-        
-        # 注意：这些值从参数传入，不是从 BaseHttpDownloadHandler 继承
-        self._download_maxsize = self._request.meta.get(
-            "download_maxsize", download_maxsize
-        )
-        self._download_warnsize = self._request.meta.get(
-            "download_warnsize", download_warnsize
-        )
-        
-        # 响应缓冲区
-        self._response: dict[str, Any] = {
-            "body": BytesIO(),
-            "flow_controlled_size": 0,
-            "headers": Headers(),
-            "status": None,
-        }
-        
-        # 响应 Deferred
-        self._deferred_response: Deferred[Response] = Deferred(_cancel)
-```
-
-#### 6.7.2 并发流控制
-
-```python
-class H2ClientProtocol(Protocol, TimeoutMixin):
-    # ...
-    
-    @property
-    def allowed_max_concurrent_streams(self) -> int:
-        """根据 SETTINGS 帧确定最大并发流数"""
-        return min(
-            self.conn.local_settings.max_concurrent_streams,
-            self.conn.remote_settings.max_concurrent_streams,
-        )
-
-    def _send_pending_requests(self) -> None:
-        """根据并发限制发送待处理请求"""
-        while (
-            self._pending_request_stream_pool
-            and self.metadata["active_streams"] < self.allowed_max_concurrent_streams
-            and self.h2_connected
-        ):
-            self.metadata["active_streams"] += 1
-            stream = self._pending_request_stream_pool.popleft()
-            stream.initiate_request()
-            self._write_to_transport()
-```
-
-### 6.8 HTTP/2 与 HTTP/1.1 处理器对比
-
-| 特性 | HTTP11DownloadHandler | H2DownloadHandler |
-|------|----------------------|-------------------|
-| **继承关系** | `BaseHttpDownloadHandler` | `BaseDownloadHandler` |
-| **HTTP 特定配置** | 继承 `_default_maxsize` 等 | 不继承，独立实现 |
-| **默认启用** | ✅ 是 | ❌ 否，需手动配置 |
-| **惰性加载** | `lazy = False` | `lazy = True` |
-| **连接池** | `HTTPConnectionPool` (Twisted) | `H2ConnectionPool` (自定义) |
-| **多路复用** | ❌ 不支持 | ✅ 支持 (Stream) |
-| **头部压缩** | ❌ 无 | ✅ HPACK |
-| **信号支持** | ✅ `bytes_received`, `headers_received` | ❌ 不支持 |
-| **代理支持** | ✅ 完整（HTTP + HTTPS 隧道） | ⚠️ 仅 HTTP 代理 |
-| **依赖** | Twisted | Twisted + `h2` + `priority` |
-
-### 6.9 已知限制
-
-根据文档，HTTP/2 处理器存在以下限制：
-
-1. **不支持明文 HTTP/2 (h2c)**：因为主流浏览器都不支持未加密的 HTTP/2
-2. **不支持更大帧大小**：连接到发送大于默认 16384 字节帧的服务器会失败
-3. **服务器推送被忽略**：虽然 HTTP/2 支持服务器推送，但 Scrapy 会忽略这些推送
-4. **不支持部分信号**：`bytes_received` 和 `headers_received` 信号不可用
-5. **HTTPS 隧道代理不支持**：无法通过 CONNECT 方法使用 HTTP/2 隧道
-
----
-
-## 7. 跨模块协作分析（复核版）
-
-### 7.1 整体调用链
-
-```
-请求进入
-    │
-    ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    Downloader.fetch()                         │
-│  scrapy/core/downloader/__init__.py:126                      │
-│                                                              │
-│  职责：                                                        │
-│  - 管理下载槽位 (Slot) 和并发控制                              │
-│  - 通过下载中间件链                                            │
-│  - 触发信号 (request_reached_downloader 等)                   │
-└───────────────────────────┬─────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────┐
-│            DownloaderMiddlewareManager.download_async()      │
-│                                                              │
-│  职责：                                                        │
-│  - 执行下载中间件（请求处理、响应处理、异常处理）               │
-└───────────────────────────┬─────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────┐
-│              Downloader._enqueue_request()                    │
-│  scrapy/core/downloader/__init__.py:176                      │
-│                                                              │
-│  职责：                                                        │
-│  - 获取或创建下载槽位 (Slot)                                   │
-│  - 将请求入队                                                  │
-│  - 触发队列处理                                                │
-└───────────────────────────┬─────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────┐
-│                Downloader._download()                         │
-│  scrapy/core/downloader/__init__.py:221                      │
-│                                                              │
-│  职责：                                                        │
-│  - 标记请求为传输中                                            │
-│  - 调用处理器执行下载                                          │
-│  - 触发信号 (response_downloaded, request_left_downloader)    │
-└───────────────────────────┬─────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────┐
-│       DownloadHandlers.download_request_async()              │
-│  scrapy/core/downloader/handlers/__init__.py:141            │
-│                                                              │
-│  职责：                                                        │
-│  - 解析 URL 协议 (scheme)                                      │
-│  - 路由到对应处理器（支持惰性加载）                             │
-│  - 调用处理器的 download_request()                             │
-└───────────────────────────┬─────────────────────────────────┘
-                            │
-            ┌───────────────┼───────────────┬───────────────┐
-            │               │               │               │
-            ▼               ▼               ▼               ▼
-    ┌───────────┐   ┌───────────┐   ┌───────────┐   ┌───────────┐
-    │ HTTP11    │   │   H2      │   │   FTP     │   │   S3      │
-    │ Handler   │   │  Handler  │   │  Handler  │   │  Handler  │
-    └───────────┘   └───────────┘   └───────────┘   └─────┬─────┘
-                                                              │
-                                                              ▼
-                                                      ┌───────────┐
-                                                      │ HTTP11    │
-                                                      │  Handler  │
-                                                      │ (委托)    │
-                                                      └───────────┘
-```
-
-### 7.2 模块依赖关系图
-
-```
-scrapy.core.downloader.Downloader
-    │
-    ├── scrapy.core.downloader.handlers.DownloadHandlers (核心分发器)
-    │       │
-    │       ├── scrapy.core.downloader.handlers.http11.HTTP11DownloadHandler
-    │       │       ├── scrapy.utils._download_handlers.BaseHttpDownloadHandler
-    │       │       │       └── scrapy.core.downloader.handlers.base.BaseDownloadHandler
-    │       │       ├── twisted.web.client.Agent
-    │       │       ├── twisted.web.client.HTTPConnectionPool
-    │       │       └── scrapy.core.downloader.contextfactory (TLS)
-    │       │
-    │       ├── scrapy.core.downloader.handlers.http2.H2DownloadHandler
-    │       │       ├── scrapy.core.downloader.handlers.base.BaseDownloadHandler (直接)
-    │       │       ├── scrapy.core.http2.agent.H2Agent
-    │       │       │       ├── scrapy.core.http2.agent.H2ConnectionPool
-    │       │       │       └── scrapy.core.http2.protocol.H2ClientProtocol
-    │       │       │               ├── scrapy.core.http2.stream.Stream
-    │       │       │               └── h2.connection.H2Connection (hyper-h2 库)
-    │       │       └── scrapy.core.downloader.contextfactory._AcceptableProtocolsContextFactory
-    │       │
-    │       ├── scrapy.core.downloader.handlers.ftp.FTPDownloadHandler
-    │       │       ├── scrapy.core.downloader.handlers.base.BaseDownloadHandler
-    │       │       └── twisted.protocols.ftp.FTPClient
-    │       │
-    │       ├── scrapy.core.downloader.handlers.s3.S3DownloadHandler
-    │       │       ├── scrapy.core.downloader.handlers.base.BaseDownloadHandler
-    │       │       ├── botocore.auth (AWS 签名)
-    │       │       └── [动态委托给配置的 HTTPS 处理器]
-    │       │
-    │       ├── scrapy.core.downloader.handlers.datauri.DataURIDownloadHandler
-    │       │       ├── scrapy.core.downloader.handlers.base.BaseDownloadHandler
-    │       │       └── w3lib.url.parse_data_uri
-    │       │
-    │       └── scrapy.core.downloader.handlers.file.FileDownloadHandler
-    │               ├── scrapy.core.downloader.handlers.base.BaseDownloadHandler
-    │               └── w3lib.url.file_uri_to_path
-    │
-    └── scrapy.core.downloader.middleware.DownloaderMiddlewareManager
-```
-
-### 7.3 共享组件详解
-
-#### 7.3.1 `wrap_twisted_exceptions`
-
-**位置**：`scrapy/utils/_download_handlers.py`
-
-**职责**：将 Twisted 异常转换为 Scrapy 标准异常
-
-```python
-@contextmanager
-def wrap_twisted_exceptions() -> Iterator[None]:
-    try:
-        yield
-    except SchemeNotSupported as e:
-        raise UnsupportedURLSchemeError(str(e)) from e
-    except CancelledError as e:
-        raise DownloadCancelledError(str(e)) from e
-    except TxConnectionRefusedError as e:
-        raise DownloadConnectionRefusedError(str(e)) from e
-    except DNSLookupError as e:
-        raise CannotResolveHostError(str(e)) from e
-    except ResponseFailed as e:
-        raise DownloadFailedError(str(e)) from e
-    except TxTimeoutError as e:
-        raise DownloadTimeoutError(str(e)) from e
-```
-
-**使用者**：
-- `HTTP11DownloadHandler` ✅
-- `H2DownloadHandler` ✅
-- 其他处理器 ❌（不使用 Twisted 网络）
-
-#### 7.3.2 `make_response`
-
-**位置**：`scrapy/utils/_download_handlers.py`
-
-**职责**：构建标准 Scrapy 响应对象
-
-```python
-def make_response(
-    url: str,
-    status: int,
-    headers: Headers,
-    body: bytes = b"",
-    flags: list[str] | None = None,
-    certificate: Certificate | None = None,
-    ip_address: IPv4Address | IPv6Address | None = None,
-    protocol: str | None = None,
-    stop_download: StopDownload | None = None,
-) -> Response:
-    # 根据内容类型选择响应类
-    respcls = responsetypes.from_args(headers=headers, url=url, body=body)
-    
-    # 构建响应
-    response = respcls(
-        url=url,
-        status=status,
-        headers=headers,
-        body=body,
-        flags=flags,
-        certificate=certificate,
-        ip_address=ip_address,
-        protocol=protocol,
-    )
-    
-    # 处理 stop_download
-    if stop_download:
-        response.flags.append("download_stopped")
-        if stop_download.fail:
-            stop_download.response = response
-            raise stop_download
-    
-    return response
-```
-
-**使用者**：
-- `HTTP11DownloadHandler` (通过 `ScrapyAgent`) ✅
-- `H2DownloadHandler` (通过 `Stream`) ✅
-- `FTPDownloadHandler` ❌（自己构建响应）
-- `DataURIDownloadHandler` ❌（自己构建响应）
-- `FileDownloadHandler` ❌（自己构建响应）
-
-#### 7.3.3 `check_stop_download`
-
-**位置**：`scrapy/utils/_download_handlers.py`
-
-**职责**：检查信号处理器是否抛出 `StopDownload` 异常
-
-```python
-def check_stop_download(
-    signal: object, crawler: Crawler, request: Request, **kwargs: Any
-) -> StopDownload | None:
-    signal_result = crawler.signals.send_catch_log(
-        signal=signal,
-        request=request,
-        spider=crawler.spider,
-        **kwargs,
-    )
-    for handler, result in signal_result:
-        if isinstance(result, Failure) and isinstance(result.value, StopDownload):
-            logger.debug(
-                f"Download stopped for {request} from signal handler {handler.__qualname__}"
-            )
-            return result.value
-    
-    return None
-```
-
-**使用者**：
-- `HTTP11DownloadHandler` ✅（支持 `headers_received` 和 `bytes_received` 信号）
-- `H2DownloadHandler` ❌（不支持这些信号）
-
-#### 7.3.4 `_load_context_factory_from_settings`
-
-**位置**：`scrapy/core/downloader/contextfactory.py`
-
-**职责**：从设置加载 TLS 上下文工厂
-
-```python
-def _load_context_factory_from_settings(crawler: Crawler) -> IPolicyForHTTPS:
-    client_context_factory = crawler.settings.get(
-        "DOWNLOADER_CLIENTCONTEXTFACTORY"
-    )
-    
-    if client_context_factory == "SENTINEL":
-        # 默认：使用 ScrapyClientContextFactory
-        return ScrapyClientContextFactory(
-            crawler.settings.get("DOWNLOADER_CLIENT_TLS_METHOD"),
-            crawler.settings.get("DOWNLOADER_CLIENT_TLS_VERBOSE_LOGGING"),
-            crawler.settings.get("DOWNLOADER_CLIENT_TLS_CIPHERS"),
-        )
-    else:
-        # 自定义上下文工厂
-        return build_from_crawler(
-            load_object(client_context_factory), crawler
-        )
-```
-
-**使用者**：
-- `HTTP11DownloadHandler` ✅
-- `H2DownloadHandler` ✅
-
-### 7.4 配置加载流程
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│  用户 settings.py                                             │
-│                                                              │
-│  DOWNLOAD_HANDLERS = {                                        │
-│      "https": "scrapy.core.downloader.handlers.http2.H2..." │
-│  }                                                            │
-└───────────────────────────┬─────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────┐
-│  BaseSettings.getwithbase("DOWNLOAD_HANDLERS")              │
-│                                                              │
-│  逻辑：                                                       │
-│  1. 获取 DOWNLOAD_HANDLERS_BASE（默认配置）                  │
-│  2. 获取 DOWNLOAD_HANDLERS（用户配置）                       │
-│  3. 合并：用户配置覆盖默认配置                                 │
-│  4. 过滤：移除值为 None 的项（表示禁用）                       │
-└───────────────────────────┬─────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────┐
-│  DownloadHandlers.__init__()                                 │
-│                                                              │
-│  1. 调用 without_none_values() 确保没有 None 值              │
-│  2. 遍历协议-处理器映射：                                      │
-│     for scheme, clspath in handlers.items():                 │
-│         self._schemes[scheme] = clspath                      │
-│         self._load_handler(scheme, skip_lazy=True)           │
-│                                                              │
-│  3. 在 _load_handler(skip_lazy=True) 中：                    │
-│     - 如果 handler.lazy == True: return None (不实例化)     │
-│     - 如果 handler.lazy == False: 实例化并缓存               │
-└─────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 8. 各协议处理器详细实现
-
-### 8.1 HTTP/1.1 处理器 (`HTTP11DownloadHandler`)
-
-**文件位置**：`scrapy/core/downloader/handlers/http11.py`
-
-#### 8.1.1 类结构
-
-```
-HTTP11DownloadHandler (继承 BaseHttpDownloadHandler)
-    │
-    ├── ScrapyAgent (封装 Twisted Agent)
-    │       ├── _get_agent() - 根据是否有代理选择不同 Agent
-    │       │       ├── 无代理: Twisted Agent
-    │       │       ├── HTTP 代理: ScrapyProxyAgent
-    │       │       └── HTTPS 代理: TunnelingAgent (CONNECT 隧道)
-    │       ├── download_request() - 执行下载
-    │       ├── _cb_latency() - 计算下载延迟
-    │       └── _cb_timeout() - 处理超时
-    │
-    ├── TunnelingAgent (HTTPS 隧道代理)
-    │       └── TunnelingTCP4ClientEndpoint
-    │
-    └── ScrapyProxyAgent (HTTP 代理)
-```
-
-#### 8.1.2 代理处理逻辑
-
-```python
-def _get_agent(self, request: Request, timeout: float) -> Agent:
-    proxy = request.meta.get("proxy")
-    
-    if proxy:
-        # 有代理的情况
-        proxy = add_http_if_no_scheme(proxy)
-        proxy_parsed = urlparse(proxy)
-        
-        if urlparse_cached(request).scheme == "https":
-            # HTTPS 通过 CONNECT 隧道
-            return self._TunnelingAgent(...)
-        else:
-            # HTTP 直接使用代理
-            return self._ProxyAgent(...)
-    
-    # 无代理，直接连接
-    return self._Agent(...)
-```
-
-### 8.2 FTP 处理器 (`FTPDownloadHandler`)
-
-**文件位置**：`scrapy/core/downloader/handlers/ftp.py`
-
-#### 8.2.1 核心特性
-
-- **基于 Twisted FTPClient**：使用 `twisted.protocols.ftp.FTPClient`
-- **HTTP 响应模拟**：将 FTP 操作结果封装为 HTTP 响应
-- **状态码映射**：
-
-| FTP 状态码 | HTTP 状态码 | 说明 |
-|------------|-------------|------|
-| 550 | 404 | 文件未找到 |
-| 其他 | 503 | 服务不可用 |
-
-#### 8.2.2 配置参数
-
-通过请求 meta 传递连接参数：
-
-- `ftp_user`：用户名（默认 `anonymous`）
-- `ftp_password`：密码（默认 `guest`）
-- `ftp_passive`：是否使用被动模式（默认 `True`）
-- `ftp_local_filename`：下载到本地文件的路径
-
-### 8.3 S3 处理器 (`S3DownloadHandler`)
-
-**文件位置**：`scrapy/core/downloader/handlers/s3.py`
-
-#### 8.3.1 设计模式：包装器 + 委托
-
-```python
-class S3DownloadHandler(BaseDownloadHandler):
-    lazy = True
-
-    def __init__(self, crawler: Crawler):
-        # 1. 检查依赖
-        if not is_botocore_available():
-            raise NotConfigured("missing botocore library")
-        
-        super().__init__(crawler)
-        
-        # 2. 初始化 AWS 签名器
-        aws_access_key_id = crawler.settings["AWS_ACCESS_KEY_ID"]
-        # ...
-        
-        # 3. 动态加载当前配置的 HTTPS 处理器
-        _http_handler = build_from_crawler(
-            load_object(crawler.settings.getwithbase("DOWNLOAD_HANDLERS")["https"]),
-            crawler,
-        )
-        self._download_http = _http_handler.download_request
-
-    async def download_request(self, request: Request) -> Response:
-        # 1. 转换 S3 URL 为 HTTP(S) URL
-        # s3://bucket/path → https://bucket.s3.amazonaws.com/path
-        url = f"{scheme}://{bucket}.s3.amazonaws.com{path}"
-        
-        # 2. 添加 AWS 签名（如果需要认证）
-        if not self.anon:
-            # 使用 botocore 签名
-            self._signer.add_auth(awsrequest)
-            request = request.replace(url=url, headers=awsrequest.headers.items())
-        
-        # 3. 委托给 HTTP 处理器
-        return await self._download_http(request)
-```
-
-**关键设计点**：
-1. **双重惰性**：类级别 `lazy = True` + 实例化时检查依赖
-2. **动态委托**：运行时加载当前配置的 HTTPS 处理器（如果用户配置了 H2，就用 H2）
-3. **协议转换**：`s3://` → `http(s)://`
-
-### 8.4 Data URI 处理器 (`DataURIDownloadHandler`)
-
-**文件位置**：`scrapy/core/downloader/handlers/datauri.py`
-
-最简单的处理器，直接解析 `data:` 协议的 URI：
-
-```python
-async def download_request(self, request: Request) -> Response:
-    uri = parse_data_uri(request.url)
-    respcls = responsetypes.from_mimetype(uri.media_type)
-    
-    if issubclass(respcls, TextResponse) and uri.media_type.split("/")[0] == "text":
-        charset = uri.media_type_parameters.get("charset")
-        return respcls(url=request.url, body=uri.data, encoding=charset)
-    
-    return respcls(url=request.url, body=uri.data)
-```
-
-### 8.5 文件处理器 (`FileDownloadHandler`)
-
-**文件位置**：`scrapy/core/downloader/handlers/file.py`
-
-处理 `file://` 协议的本地文件：
-
-```python
-async def download_request(self, request: Request) -> Response:
-    # 1. 转换为本地文件路径
-    filepath = file_uri_to_path(request.url)
-    
-    # 2. 在线程池中读取文件（避免阻塞事件循环）
-    body = await run_in_thread(Path(filepath).read_bytes)
-    
-    # 3. 根据文件类型选择响应类
-    respcls = responsetypes.from_args(filename=filepath, body=body)
-    return respcls(url=request.url, body=body)
-```
-
----
-
-## 9. 扩展点与自定义
-
-### 9.1 自定义处理器示例
-
-```python
-from scrapy.core.downloader.handlers.base import BaseDownloadHandler
-from scrapy.http import Response
-
-class MyCustomHandler(BaseDownloadHandler):
-    # 设为惰性加载（如果初始化开销大）
-    lazy = True
-    
-    def __init__(self, crawler):
-        super().__init__(crawler)
-        # 初始化资源
-    
-    async def download_request(self, request):
-        # 实现下载逻辑
-        return Response(
-            url=request.url,
-            status=200,
-            body=b"response body"
-        )
-    
-    async def close(self):
-        # 清理资源
-        pass
-```
-
-### 9.2 启用自定义处理器
-
-```python
-# settings.py
-DOWNLOAD_HANDLERS = {
-    # 添加新协议支持
-    "myproto": "myproject.handlers.MyCustomHandler",
-    # 覆盖现有协议
-    "http": "myproject.handlers.MyHttpHandler",
-    # 禁用协议
-    "ftp": None,
-}
-```
-
-### 9.3 自定义处理器注意事项
-
-1. **必须实现的方法**：
-   - `download_request(self, request) -> Response` (async)
-   - `close(self) -> None` (async, 可选但推荐)
-
-2. **必须定义的属性**：
-   - `lazy: bool`
-
-3. **异常处理**：
-   - 使用 `wrap_twisted_exceptions` 包装 Twisted 异常
-   - 或直接抛出 Scrapy 定义的异常
-
-4. **兼容性**：
-   - 新风格：返回协程（推荐）
-   - 旧风格：返回 `Deferred`，接收 `spider` 参数（已弃用）
-
----
-
-## 10. 关键事实汇总（复核版）
-
-### 10.1 继承关系修正
-
-| 处理器 | 正确继承关系 | 之前的错误描述 |
-|--------|-------------|---------------|
-| `HTTP11DownloadHandler` | `BaseHttpDownloadHandler` → `BaseDownloadHandler` | ✅ 正确 |
-| `H2DownloadHandler` | `BaseDownloadHandler`（直接） | ❌ 错误地说继承 `BaseHttpDownloadHandler` |
-| `FTPDownloadHandler` | `BaseDownloadHandler`（直接） | ✅ 正确 |
-| `S3DownloadHandler` | `BaseDownloadHandler`（直接） | ✅ 正确 |
-| `DataURIDownloadHandler` | `BaseDownloadHandler`（直接） | ✅ 正确 |
-| `FileDownloadHandler` | `BaseDownloadHandler`（直接） | ✅ 正确 |
-
-### 10.2 H2DownloadHandler 不继承 BaseHttpDownloadHandler 的影响
-
-| 特性 | HTTP11DownloadHandler | H2DownloadHandler |
-|------|----------------------|-------------------|
-| 访问 `self._default_maxsize` | ✅ 直接使用 | ❌ 无此属性 |
-| 访问 `self._default_warnsize` | ✅ 直接使用 | ❌ 无此属性 |
-| 访问 `self._fail_on_dataloss` | ✅ 直接使用 | ❌ 无此属性 |
-| 访问 `self._tls_verbose_logging` | ✅ 直接使用 | ❌ 无此属性 |
-| 访问 `self._fail_on_dataloss_warned` | ✅ 直接使用 | ❌ 无此属性 |
-| 处理 `stop_download` 信号 | ✅ 使用 `check_stop_download` | ❌ 不支持 |
-
-### 10.3 协议路由关键事实
-
-1. **路由键**：`urlparse_cached(request).scheme`（URL 的协议部分）
-2. **配置合并**：`DOWNLOAD_HANDLERS` 覆盖 `DOWNLOAD_HANDLERS_BASE`
-3. **禁用方式**：设置为 `None`
-4. **路由入口**：`DownloadHandlers.download_request_async()`
-
-### 10.4 惰性加载关键事实
-
-1. **默认值**：`BaseDownloadHandler.lazy = False`（非惰性）
-2. **检查时机**：
-   - 初始化时：`_load_handler(scheme, skip_lazy=True)`
-   - 第一次请求时：`_load_handler(scheme, skip_lazy=False)`
-3. **`skip_lazy=True` 时的逻辑**：
-   - 如果 `getattr(dhcls, "lazy", True)` → 返回 `None`（不实例化）
-   - 注意：未定义 `lazy` 属性时默认 `True`（兼容性）
-4. **惰性处理器列表**：`H2DownloadHandler`、`S3DownloadHandler`
-
-### 10.5 HTTP/2 关键事实
-
-1. **ALPN 强制**：通过 `_AcceptableProtocolsContextFactory` 强制协商 `h2`
-2. **协议验证**：TLS 握手完成后验证 `negotiatedProtocol == b"h2"`
-3. **连接池独立**：`H2ConnectionPool` 支持多路复用和待处理请求队列
-4. **流管理**：`Stream` 类独立处理 maxsize，不从 `BaseHttpDownloadHandler` 继承
-5. **配置方式**：必须手动设置 `DOWNLOAD_HANDLERS["https"]`
-
----
-
-## 11. 关键文件索引
-
-| 文件路径 | 功能描述 |
-|----------|----------|
-| `scrapy/core/downloader/__init__.py` | Downloader 主类，管理下载流程 |
-| `scrapy/core/downloader/handlers/__init__.py` | DownloadHandlers 分发器核心 |
-| `scrapy/core/downloader/handlers/base.py` | BaseDownloadHandler 抽象基类 |
-| `scrapy/utils/_download_handlers.py` | BaseHttpDownloadHandler 中间基类 + 工具函数 |
-| `scrapy/core/downloader/handlers/http11.py` | HTTP/1.1 处理器 |
-| `scrapy/core/downloader/handlers/http2.py` | HTTP/2 处理器入口 |
-| `scrapy/core/http2/agent.py` | HTTP/2 Agent 和连接池 |
-| `scrapy/core/http2/protocol.py` | HTTP/2 协议实现 |
-| `scrapy/core/http2/stream.py` | HTTP/2 流管理 |
-| `scrapy/core/downloader/handlers/ftp.py` | FTP 处理器 |
-| `scrapy/core/downloader/handlers/s3.py` | S3 处理器 |
-| `scrapy/core/downloader/handlers/datauri.py` | Data URI 处理器 |
-| `scrapy/core/downloader/handlers/file.py` | 文件处理器 |
-| `scrapy/settings/default_settings.py` | 默认处理器配置 |
-| `docs/topics/download-handlers.rst` | 处理器文档 |
-
----
-
-## 12. 设计亮点总结
-
-### 12.1 架构设计
-
-1. **可插拔架构**：通过配置即可替换或扩展处理器，无需修改核心代码
-2. **分层设计**：
-   - `Downloader`：管理并发和槽位
-   - `DownloadHandlers`：协议分发
-   - 具体处理器：协议实现
-3. **面向接口编程**：所有处理器遵循 `DownloadHandlerProtocol`
-
-### 12.2 性能优化
-
-1. **惰性加载**：优化启动性能，按需加载处理器
-2. **连接池**：HTTP/1.1 和 HTTP/2 都有连接池管理
-3. **HTTP/2 多路复用**：单连接多流，减少 TCP 握手开销
-
-### 12.3 灵活性
-
-1. **配置覆盖**：用户配置优先级 > 默认配置
-2. **动态委托**：S3 处理器运行时加载当前配置的 HTTPS 处理器
-3. **协议无关**：分发器不关心具体协议实现，只关心接口
-
-### 12.4 错误处理
-
-1. **异常标准化**：`wrap_twisted_exceptions` 将 Twisted 异常转换为 Scrapy 异常
-2. **隔离失败**：单个处理器初始化失败不影响其他处理器
+### 9.
